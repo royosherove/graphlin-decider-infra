@@ -1,0 +1,868 @@
+#!/bin/bash
+# decider-aws: operate the Strands Decider GPU host for Graphlin on AWS.
+#
+# Runs with bash 3.2 (macOS) and with bash on Linux. Needs the AWS CLI v2, the Session Manager
+# plugin, curl, gzip, lsof and ps. Uses no python3, no jq, no pkill and no GNU-only options.
+#
+# Usage: bin/decider-aws COMMAND [OPTIONS]
+#
+#   up [--replace]          Deploy the stacks, then start one host. Spot first, then on-demand.
+#                           Refuses when a host exists. --replace removes that host first.
+#   status                  Show the host, its backstop schedule and the tunnel.
+#   wait [--timeout S]      Wait until /ready answers on the host (default 1500 s).
+#   tunnel start|stop|status
+#                           Port forward 127.0.0.1:8099 to the host 127.0.0.1:8000 through SSM.
+#   smoke                   Check /ready, one request and the window 422 through the tunnel.
+#   stop                    On-demand: stop the host. Spot: terminate the host.
+#   start                   On-demand only: start the host. On a capacity error: up --replace.
+#   logs [LINES]            Bounded logs through SSM (default 80 lines). Fallback: console output.
+#   down [--dry-run]        Remove all resources of this tool in all candidate regions.
+#                           --dry-run shows the resources and the order, and changes nothing.
+#
+# Environment (all optional):
+#   DECIDER_TYPES               default "g6.xlarge g5.xlarge"
+#   DECIDER_REGIONS             default "us-east-2 us-east-1 us-west-2 eu-central-1"
+#   DECIDER_MARKETS             default "spot on-demand"
+#   DECIDER_GLOBAL_REGION       region of the global (IAM) stack, default us-east-2
+#   DECIDER_IDLE_STOP_MINUTES   idle stop on the host, default 60, 0 = off
+#   DECIDER_STOP_WAIT_SECONDS   stop wait before the message, default 1200 (20 min)
+#   DECIDER_LOCAL_PORT          tunnel port, default 8099
+#   DECIDER_STATE_DIR           local state, default <repo>/.state
+#
+# All resources get the tags Project=graphlin-decider and ManagedBy=decider-aws.
+# Language: ASD-STE100.
+
+set -u -o pipefail
+export AWS_PAGER=""
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+PROJECT=graphlin-decider
+MANAGED_BY=decider-aws
+TYPES=${DECIDER_TYPES:-"g6.xlarge g5.xlarge"}
+REGIONS=${DECIDER_REGIONS:-"us-east-2 us-east-1 us-west-2 eu-central-1"}
+MARKETS=${DECIDER_MARKETS:-"spot on-demand"}
+GLOBAL_REGION=${DECIDER_GLOBAL_REGION:-us-east-2}
+IDLE_STOP_MINUTES=${DECIDER_IDLE_STOP_MINUTES:-60}
+LOCAL_PORT=${DECIDER_LOCAL_PORT:-8099}
+REMOTE_PORT=8000
+STATE_DIR=${DECIDER_STATE_DIR:-$ROOT/.state}
+
+GLOBAL_STACK=graphlin-decider-global
+SCHEDULE_GROUP=graphlin-decider
+MODEL_NAME=strands-decider-2B-hobson-v19-bb282d7-b1485b2
+V19_REVISION=bb282d786bc251fd4e3068de3ada9ddbb38127cd
+BASE_REVISION=b1485b2fa6dfa1287294f269f5fb618e03d52d7c
+BACKSTOP_SECONDS=$((8 * 3600 + 15 * 60))
+USER_DATA_LIMIT=16384
+
+ENV_FILE=$STATE_DIR/decider-aws.env
+LAUNCH_LOG=$STATE_DIR/launch.log
+TUNNEL_PID=$STATE_DIR/decider-aws-tunnel.pid
+TUNNEL_CHILDREN=$STATE_DIR/decider-aws-tunnel.children
+TUNNEL_LOG=$STATE_DIR/decider-aws-tunnel.log
+USER_DATA=$STATE_DIR/decider-aws-user-data.sh
+TAG_FILTERS="Name=tag:Project,Values=$PROJECT Name=tag:ManagedBy,Values=$MANAGED_BY"
+STACK_TAGS="Project=$PROJECT ManagedBy=$MANAGED_BY"
+
+# Files of the boot bundle, relative to bootstrap/. install-decider.sh runs them on the host.
+BUNDLE_FILES="install-decider.sh decider-serve decider-idle-check requirements.lock models.sha256
+systemd/decider.service systemd/decider-idle.service systemd/decider-idle.timer
+systemd/decider-maxrun.service systemd/decider-maxrun.timer"
+
+if [ -d "$ROOT/.tools/bin" ]; then PATH="$ROOT/.tools/bin:$PATH"; fi
+
+# ---------------------------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------------------------
+log() { echo "[$(date -u +%H:%M:%S)] $*" >&2; }
+die() { log "ERROR: $*"; exit 1; }
+
+# Read one KEY=VALUE from the state file. The tool does not source the file.
+state_get() {
+  [ -f "$ENV_FILE" ] || return 1
+  sed -n "s/^$1=//p" "$ENV_FILE" | tail -n 1
+}
+
+need_state() {
+  INSTANCE_ID=$(state_get INSTANCE_ID) || die "no host in $ENV_FILE. Run: bin/decider-aws up"
+  REGION=$(state_get REGION)
+  MARKET=$(state_get MARKET)
+  [ -n "$INSTANCE_ID" ] && [ -n "$REGION" ] || die "$ENV_FILE is not complete"
+}
+
+# Print an epoch time as YYYY-MM-DDTHH:MM:SS (UTC). GNU date first, then BSD date.
+fmt_epoch() {
+  date -u -d "@$1" +%Y-%m-%dT%H:%M:%S 2> /dev/null || date -u -r "$1" +%Y-%m-%dT%H:%M:%S
+}
+
+# Print the AWS error code from an AWS CLI error message, for example InsufficientInstanceCapacity.
+error_code() {
+  printf '%s\n' "$1" | sed -n 's/.*An error occurred (\([A-Za-z0-9.]*\)).*/\1/p' | head -n 1
+}
+
+# Escape a text for a JSON string. Newlines become \n.
+json_str() {
+  printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | awk 'BEGIN { ORS = "" } NR > 1 { print "\\n" } { print }'
+}
+
+unique_regions() {
+  echo "$REGIONS $GLOBAL_REGION" | tr ' ' '\n' | awk 'NF && !seen[$0]++'
+}
+
+stack_output() { # REGION STACK KEY
+  aws cloudformation describe-stacks --region "$1" --stack-name "$2" \
+    --query "Stacks[0].Outputs[?OutputKey=='$3'].OutputValue" --output text 2> /dev/null
+}
+
+stack_status() { # REGION STACK
+  aws cloudformation describe-stacks --region "$1" --stack-name "$2" \
+    --query 'Stacks[0].StackStatus' --output text 2> /dev/null
+}
+
+managed_instances() { # REGION -> instance IDs that are not terminated
+  # shellcheck disable=SC2086
+  aws ec2 describe-instances --region "$1" --filters $TAG_FILTERS \
+    "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+    --query 'Reservations[].Instances[].InstanceId' --output text 2> /dev/null | tr '\t' ' '
+}
+
+instance_field() { # REGION ID QUERY
+  aws ec2 describe-instances --region "$1" --instance-ids "$2" \
+    --query "Reservations[0].Instances[0].$3" --output text 2> /dev/null
+}
+
+launch_log() {
+  mkdir -p "$STATE_DIR"
+  echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) $*" >> "$LAUNCH_LOG"
+  log "launch: $*"
+}
+
+# Run one shell script on the host through SSM Run Command. Print its output.
+# Usage: ssm_run REGION ID TIMEOUT SCRIPT. The exit status is the exit status on the host.
+ssm_run() {
+  local region=$1 id=$2 timeout=$3 script=$4 params cmd status code deadline
+  mkdir -p "$STATE_DIR"
+  params="$STATE_DIR/decider-aws-ssm.$$.json"
+  printf '{"commands":["%s"],"executionTimeout":["%s"]}' "$(json_str "$script")" "$timeout" > "$params"
+  cmd=$(aws ssm send-command --region "$region" --instance-ids "$id" --document-name AWS-RunShellScript \
+    --comment "decider-aws" --parameters "file://$params" --query Command.CommandId --output text) || return 1
+  rm -f "$params"
+  deadline=$((SECONDS + timeout + 60))
+  status=Pending
+  while [ $SECONDS -lt $deadline ]; do
+    sleep 3
+    status=$(aws ssm get-command-invocation --region "$region" --command-id "$cmd" --instance-id "$id" \
+      --query Status --output text 2> /dev/null) || continue
+    case "$status" in Pending | InProgress | Delayed) ;; *) break ;; esac
+  done
+  aws ssm get-command-invocation --region "$region" --command-id "$cmd" --instance-id "$id" \
+    --query StandardOutputContent --output text
+  code=$(aws ssm get-command-invocation --region "$region" --command-id "$cmd" --instance-id "$id" \
+    --query ResponseCode --output text 2> /dev/null)
+  [ "$code" = "0" ]
+}
+
+# ---------------------------------------------------------------------------------------------
+# Stacks
+# ---------------------------------------------------------------------------------------------
+deploy_global() {
+  log "deploy stack $GLOBAL_STACK in $GLOBAL_REGION"
+  # shellcheck disable=SC2086
+  aws cloudformation deploy --region "$GLOBAL_REGION" --stack-name "$GLOBAL_STACK" \
+    --template-file "$ROOT/cloudformation/global.yaml" --capabilities CAPABILITY_IAM \
+    --tags $STACK_TAGS --no-fail-on-empty-changeset > /dev/null || return 1
+  PROFILE_ARN=$(stack_output "$GLOBAL_REGION" "$GLOBAL_STACK" InstanceProfileArn)
+  SCHEDULER_ROLE_ARN=$(stack_output "$GLOBAL_REGION" "$GLOBAL_STACK" SchedulerRoleArn)
+  [ -n "$PROFILE_ARN" ] && [ -n "$SCHEDULER_ROLE_ARN" ]
+}
+
+global_outputs() {
+  PROFILE_ARN=$(stack_output "$GLOBAL_REGION" "$GLOBAL_STACK" InstanceProfileArn)
+  SCHEDULER_ROLE_ARN=$(stack_output "$GLOBAL_REGION" "$GLOBAL_STACK" SchedulerRoleArn)
+}
+
+deploy_regional() { # REGION
+  local region=$1 vpc out
+  vpc=$(aws ec2 describe-vpcs --region "$region" --filters Name=is-default,Values=true \
+    --query 'Vpcs[0].VpcId' --output text 2>&1) || { echo "$vpc"; return 1; }
+  if [ "$vpc" = "None" ] || [ -z "$vpc" ]; then echo "NoDefaultVpc"; return 1; fi
+  log "deploy stack $PROJECT-$region in $region (VPC $vpc)"
+  # shellcheck disable=SC2086
+  out=$(aws cloudformation deploy --region "$region" --stack-name "$PROJECT-$region" \
+    --template-file "$ROOT/cloudformation/regional.yaml" --no-fail-on-empty-changeset \
+    --parameter-overrides "VpcId=$vpc" "InstanceProfileArn=$PROFILE_ARN" \
+    --tags $STACK_TAGS 2>&1) || { echo "$out"; return 1; }
+  LAUNCH_TEMPLATE=$(stack_output "$region" "$PROJECT-$region" LaunchTemplateId)
+  [ -n "$LAUNCH_TEMPLATE" ]
+}
+
+# ---------------------------------------------------------------------------------------------
+# Boot bundle: a gzip shell archive in the EC2 user data
+# ---------------------------------------------------------------------------------------------
+build_user_data() { # MARKET -> path of the gzip file
+  local market=$1 f commit size
+  mkdir -p "$STATE_DIR"
+  commit=$(git -C "$ROOT" rev-parse --short HEAD 2> /dev/null || echo unknown)
+  if [ -n "$(git -C "$ROOT" status --porcelain -- bootstrap 2> /dev/null)" ]; then commit="$commit-dirty"; fi
+  {
+    echo '#!/bin/bash'
+    echo '# Strands Decider boot bundle. bin/decider-aws made this file. cloud-init runs it one time.'
+    echo 'set -euo pipefail'
+    echo 'install -d -m 0755 /etc/decider /opt/decider /opt/decider/bundle /opt/decider/bundle/systemd'
+    echo "cat > /etc/decider/decider.env <<'__DECIDER_EOF__'"
+    echo "IDLE_STOP_MINUTES=$IDLE_STOP_MINUTES"
+    echo "MARKET=$market"
+    echo "BUNDLE_COMMIT=$commit"
+    echo '__DECIDER_EOF__'
+    for f in $BUNDLE_FILES; do
+      [ -f "$ROOT/bootstrap/$f" ] || die "bundle file bootstrap/$f is missing"
+      if grep -q '^__DECIDER_EOF__$' "$ROOT/bootstrap/$f"; then die "bootstrap/$f has the bundle marker"; fi
+      echo "cat > /opt/decider/bundle/$f <<'__DECIDER_EOF__'"
+      # Comment lines stay in the repository. They are not in the bundle, because the
+      # user data limit is 16 KB. The Python launcher stays complete.
+      case "$f" in
+        decider-serve) cat "$ROOT/bootstrap/$f" ;;
+        *) sed -e '/^[[:space:]]*#[^!]/d' -e '/^[[:space:]]*#$/d' "$ROOT/bootstrap/$f" ;;
+      esac
+      if [ -n "$(tail -c 1 "$ROOT/bootstrap/$f")" ]; then echo; fi
+      echo '__DECIDER_EOF__'
+    done
+    echo 'exec /bin/bash /opt/decider/bundle/install-decider.sh'
+  } > "$USER_DATA"
+  gzip -9 -n -c "$USER_DATA" > "$USER_DATA.gz"
+  size=$(wc -c < "$USER_DATA.gz" | tr -d ' ')
+  [ "$size" -le "$USER_DATA_LIMIT" ] || die "user data is $size bytes, the limit is $USER_DATA_LIMIT"
+  log "user data: $(wc -c < "$USER_DATA" | tr -d ' ') bytes, gzip $size bytes, bundle $commit"
+}
+
+# ---------------------------------------------------------------------------------------------
+# Backstop schedule
+# ---------------------------------------------------------------------------------------------
+delete_backstop() { # REGION ID
+  aws scheduler delete-schedule --region "$1" --group-name "$SCHEDULE_GROUP" --name "decider-$2" > /dev/null 2>&1 || true
+}
+
+create_backstop() { # REGION ID MARKET
+  local region=$1 id=$2 market=$3 when action target
+  [ -n "${SCHEDULER_ROLE_ARN:-}" ] || global_outputs
+  when=$(fmt_epoch $(($(date -u +%s) + BACKSTOP_SECONDS)))
+  if [ "$market" = spot ]; then action=terminateInstances; else action=stopInstances; fi
+  target=$(printf '{"Arn":"arn:aws:scheduler:::aws-sdk:ec2:%s","RoleArn":"%s","Input":"{\\"InstanceIds\\":[\\"%s\\"]}"}' \
+    "$action" "$SCHEDULER_ROLE_ARN" "$id")
+  delete_backstop "$region" "$id"
+  aws scheduler create-schedule --region "$region" --group-name "$SCHEDULE_GROUP" --name "decider-$id" \
+    --description "Backstop for $id: $action at start + 8 h 15 min" \
+    --schedule-expression "at($when)" --schedule-expression-timezone UTC \
+    --flexible-time-window Mode=OFF --action-after-completion DELETE --target "$target" > /dev/null \
+    || { log "WARNING: backstop schedule not made"; return 1; }
+  log "backstop: $action $id at $when UTC"
+}
+
+# ---------------------------------------------------------------------------------------------
+# up
+# ---------------------------------------------------------------------------------------------
+wait_running() { # REGION ID -> 0 running, 1 failed (prints the state reason)
+  local region=$1 id=$2 state
+  for _ in $(seq 1 72); do
+    state=$(instance_field "$region" "$id" State.Name)
+    case "$state" in
+      running) return 0 ;;
+      shutting-down | terminated | stopping | stopped)
+        echo "$state $(instance_field "$region" "$id" StateReason.Code)"
+        return 1 ;;
+    esac
+    sleep 5
+  done
+  echo "timeout"
+  return 1
+}
+
+remove_instances() { # REGION IDS
+  local region=$1 ids=$2 id
+  [ -n "$ids" ] || return 0
+  for id in $ids; do delete_backstop "$region" "$id"; done
+  # shellcheck disable=SC2086
+  aws ec2 terminate-instances --region "$region" --instance-ids $ids > /dev/null || return 1
+  log "$region: terminate $ids. Wait."
+  # shellcheck disable=SC2086
+  aws ec2 wait instance-terminated --region "$region" --instance-ids $ids
+}
+
+# The launch template tags the instance, the volume and the network interface for both markets.
+# Only the spot request tags the one-time spot request. EC2 refuses a spot request tag
+# specification in an on-demand launch. EC2 merges these tags with the template tags.
+SPOT_REQUEST_TAGS="ResourceType=spot-instances-request,Tags=[{Key=Project,Value=$PROJECT},{Key=ManagedBy,Value=$MANAGED_BY},{Key=Name,Value=$PROJECT-host}]"
+
+try_run() { # REGION TYPE SUBNET MARKET -> prints instance ID or error text
+  local region=$1 type=$2 subnet=$3 market=$4
+  if [ "$market" = spot ]; then
+    aws ec2 run-instances --region "$region" --count 1 --instance-type "$type" --subnet-id "$subnet" \
+      --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE,Version=\$Latest" \
+      --instance-market-options '{"MarketType":"spot","SpotOptions":{"SpotInstanceType":"one-time","InstanceInterruptionBehavior":"terminate"}}' \
+      --tag-specifications "$SPOT_REQUEST_TAGS" \
+      --instance-initiated-shutdown-behavior terminate \
+      --user-data "fileb://$USER_DATA.gz" --query 'Instances[0].InstanceId' --output text 2>&1
+  else
+    aws ec2 run-instances --region "$region" --count 1 --instance-type "$type" --subnet-id "$subnet" \
+      --launch-template "LaunchTemplateId=$LAUNCH_TEMPLATE,Version=\$Latest" \
+      --instance-initiated-shutdown-behavior stop \
+      --user-data "fileb://$USER_DATA.gz" --query 'Instances[0].InstanceId' --output text 2>&1
+  fi
+}
+
+classify() { # ERROR_TEXT -> capacity | quota | region | throttle | profile | fatal
+  case "$1" in
+    *RequestLimitExceeded* | *Throttling*) echo throttle ;;
+    *"Invalid IAM Instance Profile"* | *"iamInstanceProfile"*) echo profile ;;
+    *InsufficientInstanceCapacity* | *InsufficientCapacity* | *InsufficientHostCapacity* | *Unsupported* | *SpotCapacityNotAvailable*) echo capacity ;;
+    *VcpuLimitExceeded* | *MaxSpotInstanceCountExceeded* | *InstanceLimitExceeded* | *SpotMaxPriceTooLow* | *PendingVerification*) echo quota ;;
+    *OptInRequired* | *AuthFailure* | *NoDefaultVpc* | *UnrecognizedClientException*) echo region ;;
+    *) echo fatal ;;
+  esac
+}
+
+cmd_up() {
+  local replace=0 region found type market az azs subnet out class code tries result id
+  [ "${1:-}" = "--replace" ] && replace=1
+  mkdir -p "$STATE_DIR"
+
+  # One host at a time: refuse when a managed host exists in a candidate region.
+  found=""
+  for region in $(unique_regions); do
+    for id in $(managed_instances "$region"); do found="$found $region:$id"; done
+  done
+  if [ -n "$found" ]; then
+    [ $replace -eq 1 ] || die "a managed host exists:$found. Use: bin/decider-aws up --replace"
+    for region in $(unique_regions); do
+      remove_instances "$region" "$(managed_instances "$region")" || die "$region: terminate failed"
+    done
+    rm -f "$ENV_FILE"
+  fi
+
+  deploy_global || die "global stack failed"
+  launch_log "---- up types=[$TYPES] regions=[$REGIONS] markets=[$MARKETS]"
+  DEPLOYED=" "
+  BAD_REGIONS=" "
+  for type in $TYPES; do
+    for region in $REGIONS; do
+      case "$BAD_REGIONS" in *" $region "*) continue ;; esac
+      case "$DEPLOYED" in
+        *" $region "*) LAUNCH_TEMPLATE=$(stack_output "$region" "$PROJECT-$region" LaunchTemplateId) ;;
+        *)
+          if ! out=$(deploy_regional "$region"); then
+            code=$(error_code "$out"); [ -n "$code" ] || code=$(printf '%s' "$out" | tail -n 1)
+            launch_log "$type $region - - stack-failed $code"
+            if [ "$(classify "$out")" = region ]; then BAD_REGIONS="$BAD_REGIONS$region "; continue; fi
+            die "$region: regional stack failed: $out"
+          fi
+          LAUNCH_TEMPLATE=$(stack_output "$region" "$PROJECT-$region" LaunchTemplateId)
+          [ -n "$LAUNCH_TEMPLATE" ] || die "$region: no launch template in the stack outputs"
+          DEPLOYED="$DEPLOYED$region " ;;
+      esac
+      VPC=$(aws ec2 describe-vpcs --region "$region" --filters Name=is-default,Values=true --query 'Vpcs[0].VpcId' --output text)
+      azs=$(aws ec2 describe-instance-type-offerings --region "$region" --location-type availability-zone \
+        --filters "Name=instance-type,Values=$type" --query 'InstanceTypeOfferings[].Location' --output text \
+        | tr '\t' '\n' | sort)
+      if [ -z "$azs" ]; then launch_log "$type $region - - no-offering -"; continue; fi
+      for market in $MARKETS; do
+        build_user_data "$market"
+        for az in $azs; do
+          subnet=$(aws ec2 describe-subnets --region "$region" --filters "Name=vpc-id,Values=$VPC" \
+            "Name=availability-zone,Values=$az" "Name=default-for-az,Values=true" \
+            --query 'Subnets[0].SubnetId' --output text)
+          if [ -z "$subnet" ] || [ "$subnet" = None ]; then launch_log "$type $region $az $market no-subnet -"; continue; fi
+          class=""
+          for tries in 1 2 3 4 5 6 7 8; do
+            if out=$(try_run "$region" "$type" "$subnet" "$market"); then class=ok; break; fi
+            class=$(classify "$out")
+            code=$(error_code "$out")
+            case "$class" in
+              throttle) launch_log "$type $region $az $market retry $code"; sleep $((tries * 5)) ;;
+              profile) launch_log "$type $region $az $market retry instance-profile-not-visible"; sleep 10 ;;
+              *) break ;;
+            esac
+          done
+          case "$class" in
+            ok)
+              id=$out
+              launch_log "$type $region $az $market launched $id"
+              if result=$(wait_running "$region" "$id"); then
+                launch_log "$type $region $az $market running $id"
+                {
+                  echo "INSTANCE_ID=$id"
+                  echo "REGION=$region"
+                  echo "AZ=$az"
+                  echo "INSTANCE_TYPE=$type"
+                  echo "MARKET=$market"
+                  echo "LAUNCHED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                } > "$ENV_FILE"
+                create_backstop "$region" "$id" "$market"
+                cat "$ENV_FILE"
+                return 0
+              fi
+              launch_log "$type $region $az $market failed-after-launch $result"
+              case "$result" in terminated* | shutting-down*) ;; *) remove_instances "$region" "$id" ;; esac
+              continue ;;
+            capacity) launch_log "$type $region $az $market capacity $code"; continue ;;
+            quota) launch_log "$type $region $az $market quota $code"; break ;;
+            region) launch_log "$type $region $az $market region $code"; BAD_REGIONS="$BAD_REGIONS$region "; break 2 ;;
+            throttle | profile) launch_log "$type $region $az $market gave-up $code"; continue ;;
+            *) launch_log "$type $region $az $market fatal $code"; die "run-instances: $out" ;;
+          esac
+        done
+      done
+    done
+  done
+  die "no candidate started. See $LAUNCH_LOG"
+}
+
+# ---------------------------------------------------------------------------------------------
+# status, wait, logs
+# ---------------------------------------------------------------------------------------------
+cmd_status() {
+  need_state
+  cat "$ENV_FILE"
+  aws ec2 describe-instances --region "$REGION" --instance-ids "$INSTANCE_ID" \
+    --query 'Reservations[0].Instances[0].[State.Name,InstanceType,Placement.AvailabilityZone,InstanceLifecycle,LaunchTime]' \
+    --output text | awk '{ print "state=" $1 " type=" $2 " zone=" $3 " lifecycle=" $4 " launch=" $5 }'
+  aws scheduler get-schedule --region "$REGION" --group-name "$SCHEDULE_GROUP" --name "decider-$INSTANCE_ID" \
+    --query '[ScheduleExpression,Target.Arn,State]' --output text 2> /dev/null \
+    | awk '{ print "backstop=" $1 " target=" $2 " state=" $3 }' || echo "backstop=none"
+  tunnel_status || true
+}
+
+cmd_wait() {
+  local timeout=1500 deadline state ping out
+  [ "${1:-}" = "--timeout" ] && timeout=${2:-1500}
+  need_state
+  deadline=$((SECONDS + timeout))
+  while [ $SECONDS -lt $deadline ]; do
+    state=$(instance_field "$REGION" "$INSTANCE_ID" State.Name)
+    [ "$state" = running ] || { log "state=$state"; sleep 10; continue; }
+    ping=$(aws ssm describe-instance-information --region "$REGION" \
+      --filters "Key=InstanceIds,Values=$INSTANCE_ID" --query 'InstanceInformationList[0].PingStatus' --output text 2> /dev/null)
+    [ "$ping" = Online ] || { log "SSM ping=$ping"; sleep 10; continue; }
+    out=$(ssm_run "$REGION" "$INSTANCE_ID" 60 'if [ -e /var/lib/decider/FAILED ]; then echo FAILED; cat /var/lib/decider/FAILED; exit 3; fi
+curl -fsS -m 5 http://127.0.0.1:8000/ready || { tail -n 1 /var/lib/decider/install-phases.log 2>/dev/null; systemctl is-active decider.service; exit 4; }')
+    case $? in
+      0) echo "$out"; log "ready"; return 0 ;;
+      *)
+        case "$out" in
+          FAILED*) log "the install failed: $out"; cmd_logs 60; return 1 ;;
+          *) log "not ready: $(printf '%s' "$out" | tr '\n' ' ' | cut -c1-200)" ;;
+        esac ;;
+    esac
+    sleep 20
+  done
+  log "timeout after ${timeout}s"
+  cmd_logs 60
+  return 1
+}
+
+cmd_logs() {
+  local lines=${1:-80}
+  need_state
+  case "$lines" in '' | *[!0-9]*) die "LINES must be a number" ;; esac
+  if ! ssm_run "$REGION" "$INSTANCE_ID" 60 "echo '== install phases'; cat /var/lib/decider/install-phases.log 2>/dev/null
+echo '== install log (tail)'; tail -n $lines /var/log/decider-install.log 2>/dev/null
+echo '== journal'; journalctl -u decider.service -u decider-idle.service -u decider-maxrun.service -n $lines --no-pager -o short-iso
+echo '== timers'; systemctl list-timers 'decider-*' --all --no-pager
+echo '== disk'; df -h / | tail -n 1" | cut -c1-400; then
+    log "SSM failed. Console output (tail):"
+    aws ec2 get-console-output --region "$REGION" --instance-id "$INSTANCE_ID" --latest \
+      --query Output --output text 2> /dev/null | tail -n "$lines" | cut -c1-400
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# Tunnel
+# ---------------------------------------------------------------------------------------------
+port_pids() { lsof -nP -iTCP:"$LOCAL_PORT" -sTCP:LISTEN -t 2> /dev/null; }
+
+# Compare the listeners of the local port with the tunnel records. Return 0 when the port has
+# a listener, the process in $TUNNEL_PID is alive, and each listener PID is in $TUNNEL_CHILDREN.
+# Return 1 when lsof finds no listener. Return 2 in all other cases: a different process uses
+# the port.
+port_owner() {
+  local pids pid tun=""
+  pids=$(port_pids)
+  [ -n "$pids" ] || return 1
+  [ -f "$TUNNEL_PID" ] && tun=$(cat "$TUNNEL_PID")
+  case "$tun" in '' | *[!0-9]*) return 2 ;; esac
+  kill -0 "$tun" 2> /dev/null || return 2
+  for pid in $pids; do
+    grep -q "^$pid " "$TUNNEL_CHILDREN" 2> /dev/null || return 2
+  done
+  return 0
+}
+
+# The calling shell and all its parents, as one line of PIDs. stop_pid never stops these.
+ancestors() {
+  local pid=$$ out=""
+  while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2> /dev/null; do
+    out="$out $pid"
+    pid=$(ps -o ppid= -p "$pid" 2> /dev/null | tr -d ' ')
+  done
+  echo "$out"
+}
+
+# All descendants of one PID (children, then their children). ps -A -o and awk work on macOS and Linux.
+descendants() { # PID
+  ps -A -o pid= -o ppid= 2> /dev/null | awk -v root="$1" '
+    { parent[$1] = $2; order[NR] = $1 }
+    END {
+      want[root] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (i = 1; i <= NR; i++) {
+          p = order[i]; pp = parent[p]
+          if (!(p in want) && (pp in want)) { want[p] = 1; changed = 1; print p }
+        }
+      }
+    }'
+}
+
+# Stop one PID. Do not stop it when it is the calling shell or one of its parents, or when its
+# command line does not match PATTERN (a case pattern). The pattern check prevents a stop of a
+# process that got the PID again later.
+stop_pid() { # PID PATTERN
+  case "$1" in '' | *[!0-9]*) return 0 ;; esac
+  case " $(ancestors) " in *" $1 "*) log "keep PID $1: it is the calling shell or a parent"; return 0 ;; esac
+  # shellcheck disable=SC2254
+  case "$(ps -o args= -p "$1" 2> /dev/null)" in
+    $2) kill "$1" 2> /dev/null || true ;;
+  esac
+}
+
+# Write the descendants of the aws process to $TUNNEL_CHILDREN ("PID plugin" lines).
+record_children() { # AWS_PID
+  local pid
+  for pid in $(descendants "$1"); do
+    grep -q "^$pid " "$TUNNEL_CHILDREN" 2> /dev/null || echo "$pid plugin" >> "$TUNNEL_CHILDREN"
+  done
+}
+
+# Stop the processes that "tunnel start" started, and only these. The PIDs come from
+# $TUNNEL_CHILDREN, which the tunnel process writes. The plugin stops first, then aws.
+# Do not use "pkill -f" here: its pattern can also match the command line of the calling shell.
+kill_plugins() {
+  local pid kind entry list=""
+  [ -f "$TUNNEL_CHILDREN" ] || return 0
+  while read -r pid kind; do list="$pid:$kind $list"; done < "$TUNNEL_CHILDREN"
+  for entry in $list; do
+    case "${entry#*:}" in
+      plugin) stop_pid "${entry%%:*}" '*session-manager-plugin*' ;;
+    esac
+  done
+  for entry in $list; do
+    case "${entry#*:}" in
+      aws) stop_pid "${entry%%:*}" '*start-session*' ;;
+    esac
+  done
+  rm -f "$TUNNEL_CHILDREN"
+}
+
+# The recorded tunnel processes that are alive, as "PID(kind)" words.
+alive_children() {
+  local pid kind
+  [ -f "$TUNNEL_CHILDREN" ] || return 0
+  while read -r pid kind; do
+    if kill -0 "$pid" 2> /dev/null; then printf '%s(%s) ' "$pid" "$kind"; fi
+  done < "$TUNNEL_CHILDREN"
+}
+
+# Internal: the background tunnel process. It writes the PIDs of aws and of the plugin to
+# $TUNNEL_CHILDREN. The trap stops these processes when this process stops.
+cmd_tunnel_run() {
+  local aws_pid=""
+  need_state
+  trap 'trap - EXIT; [ -n "$aws_pid" ] && record_children "$aws_pid"; kill_plugins; exit 0' EXIT INT TERM HUP
+  : > "$TUNNEL_CHILDREN"
+  aws ssm start-session --region "$REGION" --target "$INSTANCE_ID" --document-name AWS-StartPortForwardingSession \
+    --parameters "{\"portNumber\":[\"$REMOTE_PORT\"],\"localPortNumber\":[\"$LOCAL_PORT\"]}" < /dev/null &
+  aws_pid=$!
+  echo "$aws_pid aws" >> "$TUNNEL_CHILDREN"
+  for _ in $(seq 1 30); do
+    record_children "$aws_pid"
+    if grep -q ' plugin$' "$TUNNEL_CHILDREN"; then break; fi
+    kill -0 "$aws_pid" 2> /dev/null || break
+    sleep 1
+  done
+  wait "$aws_pid"
+}
+
+# Show the tunnel state. Return 0 only when the tunnel is open: each port listener is a
+# recorded tunnel process (port_owner) and /health answers. Return 2 when a different process
+# uses the port. Return 3 when a process answers /health, but lsof finds no listener PID.
+# Else return 1.
+tunnel_status() {
+  local pid="" owner find="lsof -nP -iTCP:$LOCAL_PORT -sTCP:LISTEN"
+  [ -f "$TUNNEL_PID" ] && pid=$(cat "$TUNNEL_PID")
+  if [ -n "$pid" ] && kill -0 "$pid" 2> /dev/null; then echo "tunnel process: $pid (alive)"; else echo "tunnel process: none"; fi
+  echo "plugin processes: $(alive_children)"
+  echo "port $LOCAL_PORT listeners: $(port_pids | tr '\n' ' ')"
+  port_owner
+  owner=$?
+  if [ $owner -eq 2 ]; then
+    echo "port $LOCAL_PORT: a different process uses the port. Find it with: $find"
+    return 2
+  fi
+  if curl -fsS -m 5 "http://127.0.0.1:$LOCAL_PORT/health" > /dev/null 2>&1; then
+    if [ $owner -eq 0 ]; then
+      echo "health through the tunnel: ok"
+      return 0
+    fi
+    echo "port $LOCAL_PORT: a process answers /health, but lsof finds no listener PID. Find it with: $find"
+    return 3
+  fi
+  echo "health through the tunnel: no answer"
+  return 1
+}
+
+cmd_tunnel() {
+  local find="lsof -nP -iTCP:$LOCAL_PORT -sTCP:LISTEN"
+  need_state
+  case "${1:-status}" in
+    start)
+      command -v lsof > /dev/null || die "lsof is not on PATH. The tool cannot find the listeners of port $LOCAL_PORT"
+      tunnel_status > /dev/null 2>&1
+      case $? in
+        0) log "the tunnel is already open"; return 0 ;;
+        2) die "a different process uses port $LOCAL_PORT. Find it with: $find" ;;
+        3) die "a process answers on port $LOCAL_PORT, but lsof finds no listener PID. Find it with: $find" ;;
+      esac
+      [ -z "$(port_pids)" ] || die "port $LOCAL_PORT is in use: $(port_pids | tr '\n' ' ')"
+      command -v session-manager-plugin > /dev/null || die "session-manager-plugin is not on PATH"
+      mkdir -p "$STATE_DIR"
+      nohup "$0" _tunnel-run > "$TUNNEL_LOG" 2>&1 < /dev/null &
+      echo $! > "$TUNNEL_PID"
+      for _ in $(seq 1 30); do
+        if tunnel_status > /dev/null 2>&1; then
+          log "tunnel open: 127.0.0.1:$LOCAL_PORT -> $INSTANCE_ID:$REMOTE_PORT"
+          return 0
+        fi
+        sleep 2
+      done
+      log "the tunnel did not open. Log: $TUNNEL_LOG"
+      cmd_tunnel stop
+      return 1 ;;
+    stop)
+      if [ -f "$TUNNEL_PID" ]; then stop_pid "$(cat "$TUNNEL_PID")" '*_tunnel-run*'; fi
+      sleep 1
+      kill_plugins
+      for _ in $(seq 1 10); do
+        [ -z "$(port_pids)" ] && break
+        sleep 1
+      done
+      rm -f "$TUNNEL_PID"
+      if [ -n "$(port_pids)" ]; then die "port $LOCAL_PORT is still in use: $(port_pids | tr '\n' ' ')"; fi
+      log "tunnel closed. Port $LOCAL_PORT is free." ;;
+    status) tunnel_status ;;
+    *) die "usage: bin/decider-aws tunnel start|stop|status" ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------------------------
+# smoke
+# ---------------------------------------------------------------------------------------------
+cmd_smoke() {
+  local base="http://127.0.0.1:$LOCAL_PORT" ready body out code long want fails=0
+  ready=$(curl -fsS -m 10 "$base/ready") || die "no /ready on $base. Run: bin/decider-aws tunnel start"
+  for want in "\"ready\":true" "\"model\":\"$MODEL_NAME\"" "\"v19_revision\":\"$V19_REVISION\"" \
+    "\"base_revision\":\"$BASE_REVISION\"" '"gate":{"pass":true'; do
+    case "$ready" in
+      *"$want"*) echo "PASS /ready has $want" ;;
+      *) echo "FAIL /ready has no $want"; fails=$((fails + 1)) ;;
+    esac
+  done
+  body='{"model":"'$MODEL_NAME'","state":"Help! My payouts have been failing for 3 days.","questions":{"u":{"type":"noul","instructions":"Does this convey urgency?"},"d":{"type":"choice","instructions":"Route it.","criteria":{"billing":"money","technical":"bugs","sales":"pricing"}},"f":{"type":"score","instructions":"How frustrated?","criteria":["Calm","Frustrated","Very angry"]}}}'
+  out=$(curl -sS -m 30 -w '\n%{http_code}' -H 'content-type: application/json' -d "$body" "$base/v1/systemone")
+  code=$(printf '%s' "$out" | tail -n 1)
+  case "$code:$out" in
+    200:*"\"model\":\"$MODEL_NAME\""*'"answers"'*) echo "PASS smoke HTTP 200, model $MODEL_NAME" ;;
+    *) echo "FAIL smoke HTTP $code: $(printf '%s' "$out" | head -c 300)"; fails=$((fails + 1)) ;;
+  esac
+  long=""
+  for _ in $(seq 1 400); do long="$long The deploy script reads the region list and starts one GPU host."; done
+  out=$(curl -sS -m 30 -w '\n%{http_code}' -H 'content-type: application/json' \
+    -d '{"model":"'$MODEL_NAME'","state":"'"$long"'","questions":{"q":{"type":"noul","instructions":"Is this long?"}}}' \
+    "$base/v1/systemone")
+  code=$(printf '%s' "$out" | tail -n 1)
+  case "$code:$out" in
+    422:*'"code":"context_window_exceeded"'*) echo "PASS window HTTP 422 with code context_window_exceeded" ;;
+    *) echo "FAIL window HTTP $code: $(printf '%s' "$out" | head -c 300)"; fails=$((fails + 1)) ;;
+  esac
+  [ $fails -eq 0 ] || die "smoke: $fails checks failed"
+  log "smoke: all checks pass"
+}
+
+# ---------------------------------------------------------------------------------------------
+# stop, start
+# ---------------------------------------------------------------------------------------------
+cmd_stop() {
+  need_state
+  if [ "$MARKET" = spot ]; then
+    log "a one-time spot host cannot stop. Terminate $INSTANCE_ID (the EBS volume is deleted)."
+    cmd_tunnel stop > /dev/null 2>&1 || true
+    remove_instances "$REGION" "$INSTANCE_ID" || die "terminate failed"
+    rm -f "$ENV_FILE"
+    return 0
+  fi
+  delete_backstop "$REGION" "$INSTANCE_ID"
+  aws ec2 stop-instances --region "$REGION" --instance-ids "$INSTANCE_ID" > /dev/null || die "stop failed"
+  # The AWS CLI "wait instance-stopped" stops after 10 min (40 checks, 15 s apart). The stop
+  # of a GPU host can take many minutes. Thus poll for up to DECIDER_STOP_WAIT_SECONDS (default
+  # 1200 = 20 min). If the stop takes longer, give a clear message that names the host and says
+  # that the stop continues.
+  local wait_s=${DECIDER_STOP_WAIT_SECONDS:-1200} poll_s=${DECIDER_STOP_POLL_SECONDS:-5} deadline state
+  case "$wait_s" in '' | *[!0-9]*) die "DECIDER_STOP_WAIT_SECONDS must be a number" ;; esac
+  case "$poll_s" in '' | *[!0-9]*) die "DECIDER_STOP_POLL_SECONDS must be a number" ;; esac
+  log "stop $INSTANCE_ID. Wait up to $((wait_s / 60)) min."
+  deadline=$((SECONDS + wait_s))
+  while :; do
+    state=$(instance_field "$REGION" "$INSTANCE_ID" State.Name)
+    [ "$state" = stopped ] && { log "stopped"; return 0; }
+    [ $SECONDS -ge $deadline ] && break
+    sleep "$poll_s"
+  done
+  die "the host $INSTANCE_ID did not reach the state stopped in $((wait_s / 60)) min (last state: ${state:-unknown}). The stop continues in AWS. Check it with: bin/decider-aws status"
+}
+
+cmd_start() {
+  local out
+  need_state
+  [ "$MARKET" = on-demand ] || die "start is for on-demand hosts only. This host is $MARKET. Use: bin/decider-aws up --replace"
+  if ! out=$(aws ec2 start-instances --region "$REGION" --instance-ids "$INSTANCE_ID" 2>&1); then
+    case "$(classify "$out")" in
+      capacity)
+        launch_log "start $INSTANCE_ID capacity $(error_code "$out"). Run up --replace."
+        cmd_up --replace
+        return $? ;;
+      *) die "start failed: $out" ;;
+    esac
+  fi
+  aws ec2 wait instance-running --region "$REGION" --instance-ids "$INSTANCE_ID" || die "wait failed"
+  create_backstop "$REGION" "$INSTANCE_ID" "$MARKET"
+  log "running. Run: bin/decider-aws wait"
+}
+
+# ---------------------------------------------------------------------------------------------
+# down
+# ---------------------------------------------------------------------------------------------
+cmd_down() {
+  local dry=0 region ids spots schedules arns arn stack status step=0
+  [ "${1:-}" = "--dry-run" ] && dry=1
+  do_it() { if [ $dry -eq 1 ]; then echo "    (dry run) $*"; else "$@" > /dev/null; fi; }
+  step() { step=$((step + 1)); echo "== $step. $*"; }
+
+  step "cancel the tagged spot requests"
+  for region in $(unique_regions); do
+    # shellcheck disable=SC2086
+    spots=$(aws ec2 describe-spot-instance-requests --region "$region" --filters $TAG_FILTERS \
+      "Name=state,Values=open,active" --query 'SpotInstanceRequests[].SpotInstanceRequestId' --output text 2> /dev/null)
+    [ -z "$spots" ] && continue
+    echo "  $region: $spots"
+    # shellcheck disable=SC2086
+    do_it aws ec2 cancel-spot-instance-requests --region "$region" --spot-instance-request-ids $spots
+  done
+
+  step "terminate the instances, then wait"
+  for region in $(unique_regions); do
+    ids=$(managed_instances "$region")
+    [ -z "$ids" ] && continue
+    echo "  $region: $ids"
+    # shellcheck disable=SC2086
+    do_it aws ec2 terminate-instances --region "$region" --instance-ids $ids
+    # shellcheck disable=SC2086
+    do_it aws ec2 wait instance-terminated --region "$region" --instance-ids $ids
+  done
+
+  step "delete the schedules"
+  for region in $(unique_regions); do
+    schedules=$(aws scheduler list-schedules --region "$region" --group-name "$SCHEDULE_GROUP" \
+      --query 'Schedules[].Name' --output text 2> /dev/null)
+    [ -z "$schedules" ] && continue
+    for arn in $schedules; do
+      echo "  $region: $SCHEDULE_GROUP/$arn"
+      do_it aws scheduler delete-schedule --region "$region" --group-name "$SCHEDULE_GROUP" --name "$arn"
+    done
+  done
+
+  step "delete the regional stacks"
+  for region in $(unique_regions); do
+    stack="$PROJECT-$region"
+    status=$(stack_status "$region" "$stack")
+    [ -z "$status" ] && continue
+    echo "  $region: $stack ($status)"
+    do_it aws cloudformation delete-stack --region "$region" --stack-name "$stack"
+    do_it aws cloudformation wait stack-delete-complete --region "$region" --stack-name "$stack"
+  done
+
+  step "delete the tagged leftovers"
+  for region in $(unique_regions); do
+    arns=$(aws resourcegroupstaggingapi get-resources --region "$region" \
+      --tag-filters "Key=Project,Values=$PROJECT" "Key=ManagedBy,Values=$MANAGED_BY" \
+      --query 'ResourceTagMappingList[].ResourceARN' --output text 2> /dev/null | tr '\t' '\n')
+    for arn in $arns; do
+      case "$arn" in
+        *:instance/*)
+          status=$(instance_field "$region" "${arn##*/}" State.Name)
+          [ "$status" = terminated ] && continue
+          echo "  $region: $arn ($status)" ;;
+        *:volume/*) echo "  $region: $arn"; do_it aws ec2 delete-volume --region "$region" --volume-id "${arn##*/}" ;;
+        *:network-interface/*) echo "  $region: $arn"; do_it aws ec2 delete-network-interface --region "$region" --network-interface-id "${arn##*/}" ;;
+        *:security-group/*) echo "  $region: $arn"; do_it aws ec2 delete-security-group --region "$region" --group-id "${arn##*/}" ;;
+        *:launch-template/*) echo "  $region: $arn"; do_it aws ec2 delete-launch-template --region "$region" --launch-template-id "${arn##*/}" ;;
+        *:schedule-group/*) echo "  $region: $arn"; do_it aws scheduler delete-schedule-group --region "$region" --name "${arn##*/}" ;;
+        *:cloudformation:*) ;;
+        *) echo "  $region: $arn (not deleted by this tool; check it by hand)" ;;
+      esac
+    done
+  done
+
+  step "delete the global stack"
+  status=$(stack_status "$GLOBAL_REGION" "$GLOBAL_STACK")
+  if [ -n "$status" ]; then
+    echo "  $GLOBAL_REGION: $GLOBAL_STACK ($status)"
+    do_it aws cloudformation delete-stack --region "$GLOBAL_REGION" --stack-name "$GLOBAL_STACK"
+    do_it aws cloudformation wait stack-delete-complete --region "$GLOBAL_REGION" --stack-name "$GLOBAL_STACK"
+  fi
+
+  step "stop the tunnel"
+  if [ -f "$ENV_FILE" ]; then
+    echo "  port $LOCAL_PORT, instance $(state_get INSTANCE_ID)"
+    do_it cmd_tunnel stop
+  fi
+
+  step "remove the local state"
+  for arn in "$ENV_FILE" "$TUNNEL_PID" "$TUNNEL_CHILDREN" "$TUNNEL_LOG" "$USER_DATA" "$USER_DATA.gz"; do
+    [ -e "$arn" ] && { echo "  $arn"; do_it rm -f "$arn"; }
+  done
+
+  step "verify: tagged resources that stay (resourcegroupstaggingapi get-resources)"
+  for region in $(unique_regions); do
+    arns=$(aws resourcegroupstaggingapi get-resources --region "$region" \
+      --tag-filters "Key=Project,Values=$PROJECT" "Key=ManagedBy,Values=$MANAGED_BY" \
+      --query 'ResourceTagMappingList[].ResourceARN' --output text 2> /dev/null | tr '\t' ' ')
+    echo "  $region: ${arns:-none}"
+  done
+  [ $dry -eq 1 ] && echo "dry run: nothing changed"
+  return 0
+}
+
+# ---------------------------------------------------------------------------------------------
+case "${1:-}" in
+  up) shift; cmd_up "$@" ;;
+  status) cmd_status ;;
+  wait) shift; cmd_wait "$@" ;;
+  tunnel) shift; cmd_tunnel "$@" ;;
+  _tunnel-run) cmd_tunnel_run ;;
+  _user-data) build_user_data "${2:-spot}"; echo "$USER_DATA.gz" ;;
+  smoke) cmd_smoke ;;
+  stop) cmd_stop ;;
+  start) cmd_start ;;
+  logs) shift; cmd_logs "$@" ;;
+  down) shift; cmd_down "$@" ;;
+  *) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

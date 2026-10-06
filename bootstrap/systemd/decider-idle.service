@@ -1,0 +1,8 @@
+# Idle stop. The timer starts this unit every 5 minutes.
+# Language: ASD-STE100.
+[Unit]
+Description=Strands Decider idle check (poweroff when no request came in)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/decider/bin/decider-idle-check

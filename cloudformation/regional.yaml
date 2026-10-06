@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Strands Decider for Graphlin, regional part: the security group, the launch template and
+  the schedule group for the backstop. Deploy one stack in each region that bin/decider-aws
+  uses. The instance itself is not in this stack: bin/decider-aws starts it from the launch
+  template, and tries the next candidate when EC2 has no capacity.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The default VPC of the region.
+  InstanceProfileArn:
+    Type: String
+    Description: The InstanceProfileArn output of the global stack.
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-24.04/latest/ami-id
+    Description: Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04), from the public SSM parameter.
+  VolumeSize:
+    Type: Number
+    Default: 80
+    MinValue: 60
+    MaxValue: 200
+    Description: >-
+      Root volume in GiB. The AMI and the install use approximately 60 GB. 80 GiB keeps more
+      than 15 GiB free.
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Strands Decider host. No inbound rules. Outbound TCP 443 and 80 only.
+      VpcId: !Ref VpcId
+      # No SecurityGroupIngress: access is through SSM Session Manager only.
+      # The Amazon DNS server, IMDS and the Amazon Time Sync Service are not filtered by
+      # security groups. Thus TCP 443 and 80 are sufficient.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS (SSM, PyPI, PyTorch index, Hugging Face, GitHub)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP (Ubuntu package mirrors)
+      Tags:
+        - { Key: Name, Value: graphlin-decider-host }
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        IamInstanceProfile:
+          Arn: !Ref InstanceProfileArn
+        SecurityGroupIds: [!GetAtt SecurityGroup.GroupId]
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 1
+          InstanceMetadataTags: disabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/sda1
+            Ebs:
+              VolumeSize: !Ref VolumeSize
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        # No KeyName: there is no SSH access.
+        # No UserData: bin/decider-aws gives the boot bundle at launch time, from the repository.
+        # No InstanceType and no market options: bin/decider-aws sets them for each candidate.
+        # Only the resource types that both markets make are here. Do not add the spot
+        # request type: an on-demand launch with it fails with InvalidParameterValue.
+        # bin/decider-aws tags the one-time spot request in the spot launch request.
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Project, Value: graphlin-decider }
+              - { Key: ManagedBy, Value: decider-aws }
+              - { Key: Name, Value: graphlin-decider-host }
+          - ResourceType: volume
+            Tags:
+              - { Key: Project, Value: graphlin-decider }
+              - { Key: ManagedBy, Value: decider-aws }
+              - { Key: Name, Value: graphlin-decider-host }
+          - ResourceType: network-interface
+            Tags:
+              - { Key: Project, Value: graphlin-decider }
+              - { Key: ManagedBy, Value: decider-aws }
+              - { Key: Name, Value: graphlin-decider-host }
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - { Key: Name, Value: graphlin-decider-host }
+
+  # EventBridge Scheduler schedules have no tags. This group has the tags, and
+  # bin/decider-aws puts each backstop schedule in it.
+  ScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: graphlin-decider
+
+Outputs:
+  SecurityGroupId:
+    Value: !GetAtt SecurityGroup.GroupId
+  LaunchTemplateId:
+    Value: !Ref LaunchTemplate
+  AmiId:
+    Value: !Ref AmiId
+  ScheduleGroupName:
+    Value: !Ref ScheduleGroup

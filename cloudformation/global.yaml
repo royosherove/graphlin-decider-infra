@@ -1,0 +1,79 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Strands Decider for Graphlin, global part: the instance role, the
+  instance profile and the EventBridge Scheduler role. Deploy one time, in one region.
+  bin/decider-aws deploys this stack with the tags Project=graphlin-decider and
+  ManagedBy=decider-aws. CloudFormation copies the stack tags to the resources.
+
+Resources:
+  # The GPU host role. SSM Session Manager and Run Command only.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /graphlin-decider/
+      Description: Strands Decider GPU host. SSM Session Manager and Run Command only.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        # AmazonSSMManagedInstanceCore allows ssm:GetParameter and ssm:GetParameters.
+        # The host needs no parameters. This Deny removes that access.
+        - PolicyName: deny-ssm-parameters
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Deny
+                Action: ssm:GetParameter*
+                Resource: "*"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /graphlin-decider/
+      Roles: [!Ref InstanceRole]
+
+  # The backstop schedule uses this role. It can only stop or terminate an
+  # instance that has both tags.
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /graphlin-decider/
+      Description: EventBridge Scheduler backstop for Strands Decider hosts.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: stop-or-terminate-tagged-hosts
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:TerminateInstances
+                Resource: !Sub arn:${AWS::Partition}:ec2:*:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/Project: graphlin-decider
+                    aws:ResourceTag/ManagedBy: decider-aws
+
+Outputs:
+  InstanceProfileArn:
+    Value: !GetAtt InstanceProfile.Arn
+  InstanceProfileName:
+    Value: !Ref InstanceProfile
+  InstanceRoleName:
+    Value: !Ref InstanceRole
+  SchedulerRoleArn:
+    Value: !GetAtt SchedulerRole.Arn

@@ -1,0 +1,80 @@
+#!/bin/bash
+# Stub of the AWS CLI for the offline tests of bin/decider-aws. Language: ASD-STE100.
+#
+# The stub writes each call (one line) to $STUB_AWS_LOG and gives fixed answers. It makes
+# no network call. It copies one EC2 rule: RunInstances without spot options fails with
+# InvalidParameterValue when the request or the launch template has a tag specification for
+# the resource type spot-instances-request.
+#
+# The IDs are example IDs from the AWS documentation.
+#
+# Environment:
+#   STUB_AWS_LOG     file for the call log (required)
+#   STUB_AWS_DIR     directory for the copies of the deployed templates (required)
+#   STUB_SPOT        "capacity" (default): spot gives InsufficientInstanceCapacity.
+#                    "ok": spot starts an instance.
+set -u
+log=${STUB_AWS_LOG:?}
+dir=${STUB_AWS_DIR:?}
+all="$*"
+printf '%s\n' "$all" >> "$log"
+
+fail() { # CODE MESSAGE
+  echo "aws: [ERROR]: An error occurred ($1) when calling the RunInstances operation: $2" >&2
+  exit 254
+}
+
+# The value of an option, for example: opt --template-file "$@".
+opt() {
+  local name=$1
+  shift
+  while [ $# -gt 0 ]; do
+    if [ "$1" = "$name" ] && [ $# -gt 1 ]; then echo "$2"; return 0; fi
+    shift
+  done
+  return 1
+}
+
+# 0 when the deployed regional template has spot request tags in the launch template data.
+template_tags_spot_request() {
+  [ -f "$dir/regional.yaml" ] && grep -Eq 'ResourceType:[[:space:]]*spot-instances-request' "$dir/regional.yaml"
+}
+
+case "${1:-} ${2:-}" in
+  "ec2 describe-instances")
+    case "$all" in
+      *--instance-ids*) echo running ;;
+      *) ;; # No managed host exists.
+    esac ;;
+  "cloudformation deploy")
+    tf=$(opt --template-file "$@") || { echo "stub aws: no --template-file" >&2; exit 255; }
+    cp "$tf" "$dir/$(basename "$tf")" ;;
+  "cloudformation describe-stacks")
+    case "$all" in
+      *InstanceProfileArn*) echo "arn:aws:iam::111122223333:instance-profile/graphlin-decider/stub-profile" ;;
+      *SchedulerRoleArn*) echo "arn:aws:iam::111122223333:role/graphlin-decider/stub-scheduler" ;;
+      *LaunchTemplateId*) echo "lt-0abcd290751193123" ;;
+      *StackStatus*) echo "CREATE_COMPLETE" ;;
+    esac ;;
+  "ec2 describe-vpcs") echo "vpc-1a2b3c4d" ;;
+  "ec2 describe-instance-type-offerings") echo "us-west-2a" ;;
+  "ec2 describe-subnets") echo "subnet-1a2b3c4d" ;;
+  "ec2 run-instances")
+    case "$all" in
+      *'"MarketType":"spot"'*)
+        [ "${STUB_SPOT:-capacity}" = ok ] || fail InsufficientInstanceCapacity "stub: no spot capacity."
+        echo "i-0abcdef1234567890" ;;
+      *)
+        case "$all" in
+          *spot-instances-request*) spot_tags=1 ;;
+          *) if template_tags_spot_request; then spot_tags=1; else spot_tags=0; fi ;;
+        esac
+        [ "$spot_tags" -eq 0 ] || fail InvalidParameterValue "You cannot specify tags for Spot instances requests if there are no Spot instances requests being created by the request."
+        echo "i-1234567890abcdef0" ;;
+    esac ;;
+  "scheduler delete-schedule" | "scheduler create-schedule") ;;
+  *)
+    echo "stub aws: unexpected call: $all" >&2
+    exit 255 ;;
+esac
+exit 0

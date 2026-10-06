@@ -1,0 +1,76 @@
+#!/bin/bash
+# decider-idle-check: poweroff the host when no request came in.
+#
+# The decision is "poweroff" when both conditions are true:
+#   - no POST /v1/systemone came in the last IDLE_STOP_MINUTES minutes
+#     (decider-serve writes /run/decider/last-request for each request), and
+#   - the uptime is more than IDLE_STOP_MINUTES minutes.
+# IDLE_STOP_MINUTES comes from /etc/decider/decider.env. Default 60. The value 0 disables the check.
+#
+# Usage: decider-idle-check [--dry-run] [--minutes N]
+#   --dry-run    Log the decision. Do no poweroff.
+#   --minutes N  Use N in place of IDLE_STOP_MINUTES for this run only. Use it with --dry-run.
+#
+# The shutdown behavior of the instance is "stop" (on-demand) or "terminate" (spot).
+# Language: ASD-STE100.
+set -u
+
+ENV_FILE=/etc/decider/decider.env
+LAST=/run/decider/last-request
+DRY_RUN=0
+MINUTES=
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --minutes) MINUTES=$2; shift ;;
+    *) echo "usage: decider-idle-check [--dry-run] [--minutes N]" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+IDLE_STOP_MINUTES=60
+# shellcheck disable=SC1090
+[ -r "$ENV_FILE" ] && . "$ENV_FILE"
+[ -n "$MINUTES" ] && IDLE_STOP_MINUTES=$MINUTES
+case "$IDLE_STOP_MINUTES" in
+  '' | *[!0-9]*) echo "IDLE_STOP_MINUTES is not a number: $IDLE_STOP_MINUTES" >&2; exit 2 ;;
+esac
+
+say() {
+  logger -t decider-idle "$*"
+  echo "$*"
+}
+
+if [ "$IDLE_STOP_MINUTES" -eq 0 ]; then
+  say "decision=keep reason=disabled (IDLE_STOP_MINUTES=0) dry_run=$DRY_RUN"
+  exit 0
+fi
+
+limit=$((IDLE_STOP_MINUTES * 60))
+uptime_s=$(cut -d. -f1 /proc/uptime)
+now=$(date +%s)
+if [ -e "$LAST" ]; then
+  idle_s=$((now - $(stat -c %Y "$LAST")))
+  last_text="${idle_s}s ago"
+else
+  idle_s=$uptime_s
+  last_text="none since boot"
+fi
+
+if [ "$uptime_s" -le "$limit" ]; then
+  decision=keep
+  reason="uptime ${uptime_s}s <= ${limit}s"
+elif [ "$idle_s" -le "$limit" ]; then
+  decision=keep
+  reason="last request ${last_text} <= ${limit}s"
+else
+  decision=poweroff
+  reason="last request ${last_text}, uptime ${uptime_s}s, limit ${limit}s"
+fi
+
+say "decision=$decision reason=\"$reason\" minutes=$IDLE_STOP_MINUTES dry_run=$DRY_RUN"
+if [ "$decision" = poweroff ] && [ "$DRY_RUN" -eq 0 ]; then
+  systemctl --no-block poweroff
+fi
+exit 0

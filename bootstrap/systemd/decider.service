@@ -1,0 +1,92 @@
+# Strands Decider System One server. Loopback only.
+# Language: ASD-STE100.
+[Unit]
+Description=Strands Decider System One server (127.0.0.1:8000)
+# systemd reads the device numbers for DeviceAllow= when the unit starts, before
+# ExecStartPre. Thus nvidia-uvm must be in /proc/devices before this unit starts.
+# /etc/modules-load.d/decider.conf (install-decider.sh) loads it in systemd-modules-load.service.
+After=network-online.target systemd-modules-load.service
+Wants=network-online.target
+# The boot script writes INSTALLED when the install is complete.
+ConditionPathExists=/var/lib/decider/INSTALLED
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=decider
+Group=decider
+EnvironmentFile=/etc/decider/serve.env
+Environment=HF_HOME=/var/lib/decider/hf
+Environment=HF_HUB_OFFLINE=1
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=TRANSFORMERS_OFFLINE=1
+Environment=TRITON_CACHE_DIR=/var/lib/decider/triton
+Environment=PYTHONUNBUFFERED=1
+# The CUDA runtime needs /dev/nvidia-uvm. nvidia-modprobe makes the device files. It cannot
+# replace the module load at boot: at this time, the device rules are already set.
+# The "+" prefix gives this one command full privileges.
+ExecStartPre=+-/usr/bin/nvidia-modprobe -u -c=0
+# Start time after a reboot: read the model files one time in sequence. Without this, the
+# model load reads the cold files in small parts, and that is slow on a gp3 volume.
+ExecStartPre=-/bin/sh -c 'find -L /var/lib/decider/hf /var/lib/decider/models -name "*.safetensors" -type f -exec cat {} + > /dev/null; echo "pre-read of the model files: done"'
+ExecStart=/opt/decider/bin/decider-serve /var/lib/decider/models/v19 \
+  --host 127.0.0.1 --port 8000 --device cuda --strict-window --max-batch 40 \
+  --model-name ${DECIDER_MODEL_NAME} \
+  --v19-revision ${DECIDER_V19_REVISION} --base-revision ${DECIDER_BASE_REVISION} \
+  --waiters 1 --lock-timeout 1.5 --run-dir /run/decider
+# The warm-up compiles the Triton kernels. This can take some minutes.
+TimeoutStartSec=600
+TimeoutStopSec=30
+Restart=on-failure
+RestartSec=10
+RuntimeDirectory=decider
+RuntimeDirectoryMode=0755
+# Keep /run/decider/last-request when the service restarts.
+RuntimeDirectoryPreserve=yes
+
+# Network: loopback only.
+IPAddressDeny=any
+IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# File system
+ProtectSystem=strict
+ReadWritePaths=/var/lib/decider
+ProtectHome=yes
+PrivateTmp=yes
+UMask=0027
+
+# The GPU devices must stay visible. Thus no PrivateDevices.
+# The groups are names from /proc/devices. Driver 595 names major 195 (nvidia0, nvidiactl)
+# "nvidia". Older drivers name it "nvidia-frontend". A name that is not in /proc/devices
+# allows nothing. Without major 195, CUDA finds no GPU.
+DevicePolicy=closed
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidia-frontend rw
+DeviceAllow=char-nvidia-uvm rw
+DeviceAllow=char-nvidia-caps rw
+
+# Privileges
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RemoveIPC=yes
+KeyringMode=private
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Triton and the CUDA driver make executable memory at run time. Thus no MemoryDenyWriteExecute.
+
+[Install]
+WantedBy=multi-user.target

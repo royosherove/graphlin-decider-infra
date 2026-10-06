@@ -1,0 +1,222 @@
+# Hashed lock for the Strands Decider GPU host: Linux x86_64, CPython 3.12, CUDA 12.6.
+# Made by tools/make-lock.py from tools/lock-input.txt. Do not edit by hand.
+# Install: uv pip install --require-hashes --only-binary :all: --no-deps \
+#   --index-url https://pypi.org/simple --extra-index-url https://download.pytorch.org/whl/cu126 --index-strategy unsafe-best-match -r THIS_FILE
+accelerate==1.15.0 \
+    --hash=sha256:97eacca0b73e45cb867dbf8c5d5d4dc32219544300e0c8992c7334dc2ef33cec
+    # accelerate-1.15.0-py3-none-any.whl (pypi)
+annotated-doc==0.0.5 \
+    --hash=sha256:117bac03a25ede5df5440e855b32d556049ca169ead221505badf432fed4b101
+    # annotated_doc-0.0.5-py3-none-any.whl (pypi)
+annotated-types==0.8.0 \
+    --hash=sha256:f072f4d804ea359e4eaf198b1af7a8b0943881a87f31bb764f8bf219bb9419e0
+    # annotated_types-0.8.0-py3-none-any.whl (pypi)
+anyio==4.15.1 \
+    --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101
+    # anyio-4.15.1-py3-none-any.whl (pypi)
+certifi==2026.7.22 \
+    --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775
+    # certifi-2026.7.22-py3-none-any.whl (pypi)
+click==8.5.0 \
+    --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360
+    # click-8.5.0-py3-none-any.whl (pypi)
+einops==0.8.2 \
+    --hash=sha256:54058201ac7087911181bfec4af6091bb59380360f069276601256a76af08193
+    # einops-0.8.2-py3-none-any.whl (pypi)
+fastapi==0.142.2 \
+    --hash=sha256:bd5f4d81f1e93a88bcd77caf4dfe3c2dbffc3805407a0007e9a114c18b3a670b
+    # fastapi-0.142.2-py3-none-any.whl (pypi)
+filelock==3.32.3 \
+    --hash=sha256:7f0ca4bcc0e181c60dbbd8aa9ab5b120ebb99e4e064e83636340056f833a1f09
+    # filelock-3.32.3-py3-none-any.whl (pytorch-cu126)
+fla-core==0.5.2 \
+    --hash=sha256:5e830c85bad3d0d34677f98ac7074d08687a3756f0f0499d95ceb96eb6920761
+    # fla_core-0.5.2-py3-none-any.whl (pypi)
+flash-linear-attention==0.5.2 \
+    --hash=sha256:dcf405d81f5426393b59037097aa700d0f4a841465d5028d5aa543f4502f2400
+    # flash_linear_attention-0.5.2-py3-none-any.whl (pypi)
+fsspec==2026.7.0 \
+    --hash=sha256:b57ddbafedfaef7018c1ecab32aa200a9d7ca26b77965f64e48b70061249d279
+    # fsspec-2026.7.0-py3-none-any.whl (pytorch-cu126)
+h11==0.16.0 \
+    --hash=sha256:63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86
+    # h11-0.16.0-py3-none-any.whl (pypi)
+hf-xet==1.6.0 \
+    --hash=sha256:d62671bb130879cef0ee4c9ebe47a14af6c66ec53e6d84dc15936e5ffdfac82f
+    # hf_xet-1.6.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pypi)
+httpcore==1.0.9 \
+    --hash=sha256:2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55
+    # httpcore-1.0.9-py3-none-any.whl (pypi)
+httptools==0.8.0 \
+    --hash=sha256:b15fc622b0f869d19207c4089a501d9bcc63ca5e071ffdd2f03f922df882dcb2
+    # httptools-0.8.0-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (pypi)
+httpx==0.28.1 \
+    --hash=sha256:d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad
+    # httpx-0.28.1-py3-none-any.whl (pypi)
+huggingface-hub==1.33.0 \
+    --hash=sha256:04e434b06e100eddbce9a6e817d72693a7884b10a79bd67ab48080d5c07eb899
+    # huggingface_hub-1.33.0-py3-none-any.whl (pypi)
+idna==3.20 \
+    --hash=sha256:ab7ae7122974553370f0bdb919e1a960b2cd1bc1ef0276416d896db81c14582c
+    # idna-3.20-py3-none-any.whl (pypi)
+jinja2==3.1.6 \
+    --hash=sha256:85ece4451f492d0c13c5dd7c13a64681a86afae63a5f347908daf103ce6d2f67
+    # jinja2-3.1.6-py3-none-any.whl (pypi)
+markdown-it-py==4.2.0 \
+    --hash=sha256:9f7ebbcd14fe59494226453aed97c1070d83f8d24b6fc3a3bcf9a38092641c4a
+    # markdown_it_py-4.2.0-py3-none-any.whl (pypi)
+markupsafe==3.0.3 \
+    --hash=sha256:d6dd0be5b5b189d31db7cda48b91d7e0a9795f31430b7f271219ab30f1d3ac9d
+    # markupsafe-3.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (pypi)
+mdurl==0.1.2 \
+    --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8
+    # mdurl-0.1.2-py3-none-any.whl (pypi)
+mpmath==1.3.0 \
+    --hash=sha256:a0b2b9fe80bbcd81a6647ff13108738cfb482d481d826cc0e02f5b35e5c88d2c
+    # mpmath-1.3.0-py3-none-any.whl (pytorch-cu126)
+networkx==3.6.1 \
+    --hash=sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762
+    # networkx-3.6.1-py3-none-any.whl (pytorch-cu126)
+numpy==2.5.3 \
+    --hash=sha256:b7e18c623bb5c95acb3b3328861272816ba199fb531921c5d6d0b675f1fde9e3
+    # numpy-2.5.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (pypi)
+nvidia-cublas-cu12==12.6.4.1 \
+    --hash=sha256:08ed2686e9875d01b58e3cb379c6896df8e76c75e0d4a7f7dace3d7b6d9ef8eb
+    # nvidia_cublas_cu12-12.6.4.1-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-cuda-cupti-cu12==12.6.80 \
+    --hash=sha256:6768bad6cab4f19e8292125e5f1ac8aa7d1718704012a0e3272a6f61c4bce132 \
+    --hash=sha256:a3eff6cdfcc6a4c35db968a06fcadb061cbc7d6dde548609a941ff8701b98b73
+    # nvidia_cuda_cupti_cu12-12.6.80-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl, nvidia_cuda_cupti_cu12-12.6.80-py3-none-manylinux2014_x86_64.whl (pytorch-cu126)
+nvidia-cuda-nvrtc-cu12==12.6.77 \
+    --hash=sha256:35b0cc6ee3a9636d5409133e79273ce1f3fd087abb0532d2d2e8fff1fe9efc53
+    # nvidia_cuda_nvrtc_cu12-12.6.77-py3-none-manylinux2014_x86_64.whl (pytorch-cu126)
+nvidia-cuda-runtime-cu12==12.6.77 \
+    --hash=sha256:a84d15d5e1da416dd4774cb42edf5e954a3e60cc945698dc1d5be02321c44dc8 \
+    --hash=sha256:ba3b56a4f896141e25e19ab287cd71e52a6a0f4b29d0d31609f60e3b4d5219b7
+    # nvidia_cuda_runtime_cu12-12.6.77-py3-none-manylinux2014_x86_64.whl, nvidia_cuda_runtime_cu12-12.6.77-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-cudnn-cu12==9.5.1.17 \
+    --hash=sha256:30ac3869f6db17d170e0e556dd6cc5eee02647abc31ca856634d5a40f82c15b2
+    # nvidia_cudnn_cu12-9.5.1.17-py3-none-manylinux_2_28_x86_64.whl (pytorch-cu126)
+nvidia-cufft-cu12==11.3.0.4 \
+    --hash=sha256:768160ac89f6f7b459bee747e8d175dbf53619cfe74b2a5636264163138013ca \
+    --hash=sha256:ccba62eb9cef5559abd5e0d54ceed2d9934030f51163df018532142a8ec533e5
+    # nvidia_cufft_cu12-11.3.0.4-py3-none-manylinux2014_x86_64.whl, nvidia_cufft_cu12-11.3.0.4-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-cufile-cu12==1.11.1.6 \
+    --hash=sha256:cc23469d1c7e52ce6c1d55253273d32c565dd22068647f3aa59b3c6b005bf159
+    # nvidia_cufile_cu12-1.11.1.6-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-curand-cu12==10.3.7.77 \
+    --hash=sha256:99f1a32f1ac2bd134897fc7a203f779303261268a65762a623bf30cc9fe79117 \
+    --hash=sha256:a42cd1344297f70b9e39a1e4f467a4e1c10f1da54ff7a85c12197f6c652c8bdf
+    # nvidia_curand_cu12-10.3.7.77-py3-none-manylinux2014_x86_64.whl, nvidia_curand_cu12-10.3.7.77-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-cusolver-cu12==11.7.1.2 \
+    --hash=sha256:6cf28f17f64107a0c4d7802be5ff5537b2130bfc112f25d5a30df227058ca0e6 \
+    --hash=sha256:e9e49843a7707e42022babb9bcfa33c29857a93b88020c4e4434656a655b698c
+    # nvidia_cusolver_cu12-11.7.1.2-py3-none-manylinux2014_x86_64.whl, nvidia_cusolver_cu12-11.7.1.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-cusparse-cu12==12.5.4.2 \
+    --hash=sha256:23749a6571191a215cb74d1cdbff4a86e7b19f1200c071b3fcf844a5bea23a2f \
+    --hash=sha256:7556d9eca156e18184b94947ade0fba5bb47d69cec46bf8660fd2c71a4b48b73
+    # nvidia_cusparse_cu12-12.5.4.2-py3-none-manylinux2014_x86_64.whl, nvidia_cusparse_cu12-12.5.4.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-cusparselt-cu12==0.6.3 \
+    --hash=sha256:e5c8a26c36445dd2e6812f1177978a24e2d37cacce7e090f297a688d1ec44f46
+    # nvidia_cusparselt_cu12-0.6.3-py3-none-manylinux2014_x86_64.whl (pytorch-cu126)
+nvidia-nccl-cu12==2.26.2 \
+    --hash=sha256:694cf3879a206553cc9d7dbda76b13efaf610fdb70a50cba303de1b0d1530ac6
+    # nvidia_nccl_cu12-2.26.2-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+nvidia-nvjitlink-cu12==12.6.85 \
+    --hash=sha256:eedc36df9e88b682efe4309aa16b5b4e78c2407eac59e8c10a6a47535164369a
+    # nvidia_nvjitlink_cu12-12.6.85-py3-none-manylinux2010_x86_64.manylinux_2_12_x86_64.whl (pytorch-cu126)
+nvidia-nvtx-cu12==12.6.77 \
+    --hash=sha256:6574241a3ec5fdc9334353ab8c479fe75841dbe8f4532a8fc97ce63503330ba1 \
+    --hash=sha256:b90bed3df379fa79afbd21be8e04a0314336b8ae16768b58f2d34cb1d04cd7d2
+    # nvidia_nvtx_cu12-12.6.77-py3-none-manylinux2014_x86_64.whl, nvidia_nvtx_cu12-12.6.77-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (pytorch-cu126)
+opentelemetry-api==1.45.0 \
+    --hash=sha256:80e068aba7cd56c8b58512d6a36f8d25cb1dfaa0c0a4cc1c938ccf9f362d9cb3
+    # opentelemetry_api-1.45.0-py3-none-any.whl (pypi)
+packaging==26.3 \
+    --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
+    # packaging-26.3-py3-none-any.whl (pypi)
+peft==0.21.0 \
+    --hash=sha256:b64eb75fd9dece7401c70e675b8d9de024993b70483691b41c62876f0c7809b7
+    # peft-0.21.0-py3-none-any.whl (pypi)
+psutil==7.2.2 \
+    --hash=sha256:076a2d2f923fd4821644f5ba89f059523da90dc9014e85f8e45a5774ca5bc6f9
+    # psutil-7.2.2-cp36-abi3-manylinux2010_x86_64.manylinux_2_12_x86_64.manylinux_2_28_x86_64.whl (pypi)
+pydantic==2.13.5 \
+    --hash=sha256:346a034f080da3755d8e9cb5e00e8b07de1d39e4f6e2c87d8ab7cafa0b269a73
+    # pydantic-2.13.5-py3-none-any.whl (pypi)
+pydantic-core==2.46.5 \
+    --hash=sha256:0fc5be0abd4a407e200d844b404e33639a554e7bd0d448e7b9ae181be4789ac2
+    # pydantic_core-2.46.5-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (pypi)
+pygments==2.21.0 \
+    --hash=sha256:2363c69b61c4a97c838da3b130dcd6468f4848992b21a82f2a63ec34377137d9
+    # pygments-2.21.0-py3-none-any.whl (pypi)
+python-dotenv==1.2.4 \
+    --hash=sha256:42269a8a5b3fd54ffa6f3d84b18abed50064717576b4ecf03dc4a55d8aa04fdc
+    # python_dotenv-1.2.4-py3-none-any.whl (pypi)
+pyyaml==6.0.3 \
+    --hash=sha256:ba1cc08a7ccde2d2ec775841541641e4548226580ab850948cbfda66a1befcdc
+    # pyyaml-6.0.3-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (pypi)
+regex==2026.9.29 \
+    --hash=sha256:39ab5894d971f9ac68baa6eca5c50387db579cfcacf36ae8df3feceb1815e6d0
+    # regex-2026.9.29-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (pypi)
+rich==15.0.0 \
+    --hash=sha256:33bd4ef74232fb73fe9279a257718407f169c09b78a87ad3d296f548e27de0bb
+    # rich-15.0.0-py3-none-any.whl (pypi)
+safetensors==0.8.0 \
+    --hash=sha256:fd6f3f93c9a0a7cc2788ee63fb763353d4bd2e89b0751bc78fcf7dda00bea774
+    # safetensors-0.8.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (pypi)
+setuptools==78.1.0 \
+    --hash=sha256:3e386e96793c8702ae83d17b853fb93d3e09ef82ec62722e61da5cd22376dcd8
+    # setuptools-78.1.0-py3-none-any.whl (pypi)
+setuptools-scm==9.2.2 \
+    --hash=sha256:30e8f84d2ab1ba7cb0e653429b179395d0c33775d54807fc5f1dd6671801aef7
+    # setuptools_scm-9.2.2-py3-none-any.whl (pypi)
+shellingham==1.5.4 \
+    --hash=sha256:7ecfff8f2fd72616f7481040475a65b2bf8af90a56c89140852d1120324e8686
+    # shellingham-1.5.4-py2.py3-none-any.whl (pypi)
+starlette==1.7.0 \
+    --hash=sha256:67f8e99895493dd2911a03f11314af6ceebeae4e704bb9f43dfc6a9db151c93e
+    # starlette-1.7.0-py3-none-any.whl (pypi)
+sympy==1.14.0 \
+    --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5
+    # sympy-1.14.0-py3-none-any.whl (pytorch-cu126)
+tokenizers==0.23.2 \
+    --hash=sha256:41c2f84d172449b4dadb9cdc508e3e364076613c35b16e76ecfe47a60d1e3305
+    # tokenizers-0.23.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (pypi)
+torch==2.7.1+cu126 \
+    --hash=sha256:63bce0590bc540fc16139e2be0177847585182b8c5e68d7f9213789d1d96c978
+    # torch-2.7.1+cu126-cp312-cp312-manylinux_2_28_x86_64.whl (pytorch-cu126)
+tqdm==4.70.1 \
+    --hash=sha256:c293e525e6fef9c20e8728fd4612df02a0aa31bb5fe91ecd93e123b1b7bffa73
+    # tqdm-4.70.1-py3-none-any.whl (pypi)
+transformers==5.17.0 \
+    --hash=sha256:78ec1ce21579b38dfb83950a0658cd119f87212a2fcfdff478096ce9d6c03801
+    # transformers-5.17.0-py3-none-any.whl (pypi)
+triton==3.3.1 \
+    --hash=sha256:9999e83aba21e1a78c1f36f21bce621b77bcaa530277a50484a7cb4a822f6e43
+    # triton-3.3.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (pytorch-cu126)
+typer==0.27.2 \
+    --hash=sha256:b3a5fc4342d5fc8fda8fc3010b1cf117e9249aab7fae800c2eff62fd3842d97d
+    # typer-0.27.2-py3-none-any.whl (pypi)
+typing-extensions==4.16.0 \
+    --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8
+    # typing_extensions-4.16.0-py3-none-any.whl (pytorch-cu126)
+typing-inspection==0.4.4 \
+    --hash=sha256:65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147
+    # typing_inspection-0.4.4-py3-none-any.whl (pypi)
+uvicorn==0.54.0 \
+    --hash=sha256:505bdb0f318731d45f1f712071fc781a8981f6847a31c902c9f5e652d4f67faf
+    # uvicorn-0.54.0-py3-none-any.whl (pypi)
+uvloop==0.23.0 \
+    --hash=sha256:090865d8ce7a03986755a3ce711b7dd0d4b44eb14ab74368b717f3fad1180208
+    # uvloop-0.23.0-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (pypi)
+watchfiles==1.3.0 \
+    --hash=sha256:b5768b49e426fd5b550b012c866db347cdf15c398ef98dc557b6e6b72fa74cd1
+    # watchfiles-1.3.0-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (pypi)
+websockets==17.2 \
+    --hash=sha256:6627b913b8586b1c06db9516b31dd0dfbc621de3bb9312616d92a7e44f268a5b \
+    --hash=sha256:6aa59f0ef92e796b2db6f5f26550c4713c0e4036899fadf02f55e2ed4db0b7ae
+    # websockets-17.2-cp312-cp312-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl, websockets-17.2-py3-none-any.whl (pypi)
+wheel==0.48.0 \
+    --hash=sha256:3217dcc807155e45db462d7ef2431f5ddda0d7273b700d05a67b271ceb1287ab
+    # wheel-0.48.0-py3-none-any.whl (pypi)

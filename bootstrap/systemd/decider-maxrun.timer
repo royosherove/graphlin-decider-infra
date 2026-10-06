@@ -1,0 +1,12 @@
+# Maximum run time: poweroff 8 hours after each boot.
+# The shutdown behavior is "stop" for on-demand and "terminate" for spot.
+# Language: ASD-STE100.
+[Unit]
+Description=Strands Decider poweroff 8 hours after boot
+
+[Timer]
+OnBootSec=8h
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

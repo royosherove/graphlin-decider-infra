@@ -1,0 +1,516 @@
+#!/opt/decider/venv/bin/python
+"""decider-serve: serve Strands Decider v19 on the loopback interface.
+
+The launcher does these steps at each start:
+
+ 1. Identity checks. It runs `hf_export verify` on the v19 files. It compares the v19
+    revision, the base model and the base revision with the pins. When a check fails, the
+    process stops and systemd does not start the service.
+ 2. It loads the model with `strands_decider.server.create_app` (--strict-window, --max-batch).
+ 3. Warm-up. It sends each warm-up input to the engine before the port opens. Thus
+    Triton compiles and autotunes its kernels before the first real request. First, each
+    question-chunk size B (1 to --max-batch) one time. Then the shapes. Then it
+    compares the warm shape times with the reference times (gate: less than 1.5 times the
+    reference). The log and /ready give the warm-up times.
+ 4. It opens the port, writes /run/decider/ready and sends READY=1 to systemd (Type=notify).
+
+Request handling:
+
+ - One evaluation at a time: the torch engine keeps request data on one shared object.
+   One request can wait for the lock. The waiter gets the lock in 1.5 s or less. Else,
+   and for each request after the waiter, the server returns 503 with `Retry-After: 1`
+   and {"detail": "busy", "code": "busy"}.
+ - The window 422 gets the field "code": "context_window_exceeded".
+ - TrustedHost: the Host header must be 127.0.0.1 or localhost.
+ - Each POST /v1/systemone writes the time of /run/decider/last-request. The idle timer
+   reads it.
+ - The access log has the method, the path, the status and the time only. The server keeps
+   no request data.
+
+Language: ASD-STE100.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import os
+import socket
+import statistics
+import sys
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+LOOPBACK = {"127.0.0.1", "::1"}
+ALLOWED_HOSTS = ["127.0.0.1", "localhost"]
+WINDOW_TEXT = "exceeds the context window"
+BASE_REPO = "Qwen/Qwen3.5-2B-Base"
+
+# Reference server p50 in ms on one NVIDIA L4 GPU (g6.xlarge). Key: target tokens / questions.
+REFERENCE_MS: Dict[str, float] = {
+    "256/1q": 62, "256/4q": 131, "1024/1q": 137, "1024/4q": 191,
+    "2048/1q": 302, "2048/4q": 358, "3800/1q": 635, "3800/4q": 693,
+}
+GATE_FACTOR = 1.5
+
+# The warm-up inputs: (target input tokens, number of questions). Keep all warm-up
+# inputs in this one list. A change of the warm-up recipe is then a change of this list.
+WARMUP_SHAPES: List[Tuple[int, int]] = [
+    (256, 1), (256, 4), (1024, 1), (1024, 4), (2048, 1), (2048, 4), (3800, 1), (3800, 4),
+    (3800, 25), (3800, 40),
+]
+
+# Triton compiles and autotunes some kernels again for each question-chunk size B
+# (--max-batch 40), in memory only. Graphlin sends 40 questions or fewer in one request.
+# Thus warm up each B from 1 to 40 one time.
+WARMUP_CHUNK_SIZES: List[int] = list(range(1, 41))
+# l2norm_fwd_kernel also compiles again for each NB = cdiv(rows, 65536). The rows increase
+# with B x the question tokens, and the first request with a new NB is slow. Thus also
+# chunk size 40 with these filler words for each question (questions up to ~600 tokens).
+WARMUP_LONG_QUESTION_WORDS: List[int] = list(range(25, 576, 25))
+# Each warm-up step extends the systemd start timeout by this time (EXTEND_TIMEOUT_USEC).
+WARMUP_STEP_TIMEOUT_S = 120
+
+SENTENCE = (
+    "The deploy script reads the region list and starts one GPU host in the first zone "
+    "that has capacity. "
+)
+TOPICS = ["billing", "network", "storage", "identity", "compute", "database"]
+RISK = ["none", "low", "medium", "high", "critical"]
+
+log = logging.getLogger("decider-serve")
+
+
+class Busy(Exception):
+    """The lock and the waiter place are not free."""
+
+
+class Gate:
+    """One evaluation at a time, with a fixed number of waiters and a wait timeout."""
+
+    def __init__(self, waiters: int, timeout: float) -> None:
+        self._lock = threading.Lock()
+        self._places = threading.BoundedSemaphore(1 + waiters)
+        self._timeout = timeout
+
+    def run(self, fn: Callable[..., Any], *args: Any) -> Any:
+        if not self._places.acquire(blocking=False):
+            raise Busy()
+        try:
+            if not self._lock.acquire(timeout=self._timeout):
+                raise Busy()
+            try:
+                return fn(*args)
+            finally:
+                self._lock.release()
+        finally:
+            self._places.release()
+
+
+# ---------------------------------------------------------------------------------------------
+# Identity checks
+# ---------------------------------------------------------------------------------------------
+def fail(message: str) -> None:
+    log.error("identity check failed: %s", message)
+    raise SystemExit(f"decider-serve: identity check failed: {message}")
+
+
+def check_files(checkpoint: str, v19_revision: str, base_revision: str, model_name: str) -> None:
+    from huggingface_hub import snapshot_download
+    from strands_decider import hf_export
+
+    # The files must agree with MANIFEST.sha256, and the export rules must pass.
+    hf_export.verify(checkpoint)
+    log.info("identity: hf_export verify passed for %s", checkpoint)
+
+    with open(os.path.join(checkpoint, "provenance.json"), encoding="utf-8") as handle:
+        provenance = json.load(handle)
+    if provenance.get("base_model") != BASE_REPO:
+        fail(f"provenance base_model={provenance.get('base_model')!r}, want {BASE_REPO!r}")
+    if provenance.get("base_model_revision") != base_revision:
+        fail(f"provenance base_model_revision={provenance.get('base_model_revision')!r}, want {base_revision!r}")
+
+    # huggingface_hub writes one .metadata file for each downloaded file. Line 1 is the commit.
+    meta_root = os.path.join(checkpoint, ".cache", "huggingface", "download")
+    commits = set()
+    for root, _, names in os.walk(meta_root):
+        for name in names:
+            if name.endswith(".metadata"):
+                with open(os.path.join(root, name), encoding="utf-8") as handle:
+                    commits.add(handle.readline().strip())
+    if commits != {v19_revision}:
+        fail(f"v19 download commits {sorted(commits)}, want {v19_revision}")
+
+    snapshot = snapshot_download(BASE_REPO, revision=base_revision, local_files_only=True)
+    if os.path.basename(os.path.normpath(snapshot)) != base_revision:
+        fail(f"base snapshot {snapshot} is not revision {base_revision}")
+
+    if len(model_name) > 64:
+        fail(f"served name has {len(model_name)} characters, the maximum is 64")
+    suffix = f"-{v19_revision[:7]}-{base_revision[:7]}"
+    if not model_name.endswith(suffix):
+        fail(f"served name {model_name!r} does not end with {suffix!r}")
+    log.info("identity: v19 %s, base %s %s, served name %s", v19_revision, BASE_REPO, base_revision, model_name)
+
+
+def check_engine(engine: Any, base_revision: str) -> None:
+    config = engine.model.config
+    if config.base_model != BASE_REPO or config.base_revision != base_revision:
+        fail(f"engine base {config.base_model}@{config.base_revision}, want {BASE_REPO}@{base_revision}")
+
+
+# ---------------------------------------------------------------------------------------------
+# Warm-up
+# ---------------------------------------------------------------------------------------------
+def state_of(sentences: int, salt: int = 0) -> str:
+    return f"Ticket {salt} is about {TOPICS[salt % len(TOPICS)]}. " + SENTENCE * sentences
+
+
+def questions_of(count: int, words: int = 0) -> Dict[str, Any]:
+    """The same questions as tools/decider-probe.py.
+
+    words > 0 adds that number of filler words to each question (long questions)."""
+    base = {
+        "fail": {"type": "noul", "instructions": "Does this text describe a failure?"},
+        "topic": {"type": "choice", "instructions": "Which area does this text discuss?",
+                  "criteria": {t: None for t in TOPICS}},
+        "risk": {"type": "score", "instructions": "How risky is this change?", "criteria": RISK},
+        "action": {"type": "noul", "instructions": "Does the text ask for an action?"},
+    }
+    out: Dict[str, Any] = {}
+    if count == 1:
+        out = {"fail": base["fail"]}
+    elif count == 4:
+        out = base
+    else:
+        for i in range(count):
+            kind = i % 3
+            if kind == 0:
+                out[f"q{i}"] = {"type": "noul", "instructions": f"Does item {i} of this text describe a failure?"}
+            elif kind == 1:
+                out[f"q{i}"] = {"type": "choice", "instructions": f"Which area does item {i} discuss?",
+                                "criteria": {t: None for t in TOPICS}}
+            else:
+                out[f"q{i}"] = {"type": "score", "instructions": f"How risky is change {i}?", "criteria": RISK}
+    if words > 0:
+        filler = " Note:" + " delta" * words
+        out = {name: dict(q, instructions=q["instructions"] + filler) for name, q in out.items()}
+    return out
+
+
+class Warmup:
+    def __init__(self, engine: Any, model_name: str) -> None:
+        from strands_decider.schema import SystemOneRequest
+
+        self.engine = engine
+        self.model_name = model_name
+        self.request_type = SystemOneRequest
+        self.tokens_base = 0
+        self.tokens_per_sentence = 1.0
+
+    def evaluate(self, sentences: int, questions: int, words: int = 0) -> Tuple[float, int]:
+        request = self.request_type(model=self.model_name, state=state_of(sentences),
+                                    questions=questions_of(questions, words))
+        started = time.perf_counter()
+        response = self.engine.evaluate(request)
+        return (time.perf_counter() - started) * 1000.0, response.usage.input_tokens
+
+    def sentences_for(self, tokens: int) -> int:
+        return max(0, int((tokens - self.tokens_base) / self.tokens_per_sentence))
+
+    def chunks(self, notify: Callable[[str], None]) -> Tuple[Dict[str, float], float]:
+        """Send each chunk size one time. Return the times in ms and the total in s."""
+        started = time.perf_counter()
+        max_batch = int(getattr(getattr(self.engine, "cfg", None), "max_batch", 0) or 0)
+        steps = [(size, 0) for size in WARMUP_CHUNK_SIZES]
+        steps += [(max(WARMUP_CHUNK_SIZES), words) for words in WARMUP_LONG_QUESTION_WORDS]
+        chunk_ms: Dict[str, float] = {}
+        for size, words in steps:
+            key = f"{size}q" if words == 0 else f"{size}q+{words}w"
+            notify(f"EXTEND_TIMEOUT_USEC={WARMUP_STEP_TIMEOUT_S * 1000000}\nSTATUS=warm-up chunk {key}")
+            ms, _ = self.evaluate(0, size, words)
+            chunk_ms[key] = round(ms, 1)
+        total_s = round(time.perf_counter() - started, 1)
+        if max_batch and max_batch > max(WARMUP_CHUNK_SIZES):
+            log.warning("warm-up: --max-batch %d is more than the largest warm-up chunk size %d",
+                        max_batch, max(WARMUP_CHUNK_SIZES))
+        slowest = max(chunk_ms, key=lambda k: chunk_ms[k])
+        log.info("warm-up chunk sizes %d to %d and %d long-question steps: %.1f s, slowest %s %.1f ms",
+                 min(WARMUP_CHUNK_SIZES), max(WARMUP_CHUNK_SIZES), len(WARMUP_LONG_QUESTION_WORDS),
+                 total_s, slowest, chunk_ms[slowest])
+        return chunk_ms, total_s
+
+    def run(self, notify: Callable[[str], None]) -> Dict[str, Any]:
+        started = time.perf_counter()
+        self.evaluate(0, 1)  # The first call compiles the kernels.
+        _, t0 = self.evaluate(0, 1)
+        _, t20 = self.evaluate(20, 1)
+        self.tokens_base, self.tokens_per_sentence = t0, (t20 - t0) / 20.0
+        chunk_ms, chunks_s = self.chunks(notify)
+        shapes = [(f"{target}/{count}q", target, count) for target, count in WARMUP_SHAPES]
+
+        warm_ms: Dict[str, float] = {}
+        tokens: Dict[str, int] = {}
+        for key, target, count in shapes:
+            notify(f"EXTEND_TIMEOUT_USEC={WARMUP_STEP_TIMEOUT_S * 1000000}\nSTATUS=warm-up {key}")
+            sentences = self.sentences_for(target)
+            for _ in range(2):  # Compile for this shape.
+                self.evaluate(sentences, count)
+            times = []
+            for _ in range(3):
+                ms, used = self.evaluate(sentences, count)
+                times.append(ms)
+                tokens[key] = used
+            warm_ms[key] = round(statistics.median(times), 1)
+            log.info("warm-up %s: %d input tokens, median %.1f ms", key, tokens[key], warm_ms[key])
+
+        failed = []
+        reference = dict(REFERENCE_MS)
+        for key, ms in warm_ms.items():
+            if key not in reference:
+                reference[key] = ms  # A new shape: this time is its reference.
+            elif ms >= GATE_FACTOR * reference[key]:
+                failed.append(key)
+        gate = {"pass": not failed, "factor": GATE_FACTOR, "failed": failed, "reference_ms": reference}
+        if failed:
+            log.warning("warm-up gate: FAIL for %s", failed)
+        else:
+            log.info("warm-up gate: pass")
+        total_s = round(time.perf_counter() - started, 1)
+        log.info("warm-up total: %.1f s (chunk sizes %.1f s)", total_s, chunks_s)
+        return {"warmup_ms": warm_ms, "input_tokens": tokens, "gate": gate,
+                "warmup_chunk_ms": chunk_ms, "warmup_chunks_s": chunks_s,
+                "warmup_total_s": total_s}
+
+
+# ---------------------------------------------------------------------------------------------
+# systemd and run-time files
+# ---------------------------------------------------------------------------------------------
+def sd_notify(message: str) -> None:
+    address = os.environ.get("NOTIFY_SOCKET")
+    if not address:
+        return
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC) as sock:
+            sock.connect(address)
+            sock.sendall(message.encode("utf-8"))
+    except OSError as exc:
+        log.warning("sd_notify failed: %s", exc)
+
+
+def write_atomic(path: str, text: str) -> None:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def remove(path: str) -> None:
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def gpu_memory_mib() -> Dict[str, Any]:
+    import torch
+
+    if not torch.cuda.is_available():
+        return {}
+    mib = 1024 * 1024
+    return {"allocated": round(torch.cuda.memory_allocated() / mib, 1),
+            "reserved": round(torch.cuda.memory_reserved() / mib, 1),
+            "max_reserved": round(torch.cuda.max_memory_reserved() / mib, 1)}
+
+
+# ---------------------------------------------------------------------------------------------
+# ASGI middleware
+# ---------------------------------------------------------------------------------------------
+class AccessLog:
+    """Log the method, the path, the status and the time. Nothing more."""
+
+    def __init__(self, app: Any) -> None:
+        self.app = app
+        self.log = logging.getLogger("decider-serve.access")
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        started = time.perf_counter()
+        status = [0]
+
+        async def send_status(message: Dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                status[0] = message["status"]
+            await send(message)
+
+        try:
+            await self.app(scope, receive, send_status)
+        finally:
+            self.log.info("%s %s %d %.1f ms", scope.get("method"), scope.get("path"), status[0],
+                          (time.perf_counter() - started) * 1000.0)
+
+
+class Activity:
+    """Write the time of the last POST /v1/systemone. The idle timer reads the file time."""
+
+    def __init__(self, app: Any, path: str) -> None:
+        self.app = app
+        self.path = path
+
+    async def __call__(self, scope: Dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] == "http" and scope.get("method") == "POST" and scope.get("path") == "/v1/systemone":
+            try:
+                with open(self.path, "w", encoding="utf-8") as handle:
+                    handle.write(f"{time.time():.0f}\n")
+            except OSError as exc:
+                log.warning("cannot write %s: %s", self.path, exc)
+        await self.app(scope, receive, send)
+
+
+# ---------------------------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------------------------
+def build_app(args: argparse.Namespace, ready: Dict[str, Any]) -> Any:
+    from fastapi.exception_handlers import http_exception_handler
+    from fastapi.responses import JSONResponse
+    from starlette.exceptions import HTTPException as StarletteHTTPException
+    from starlette.middleware.trustedhost import TrustedHostMiddleware
+    from strands_decider import server
+
+    app = server.create_app(
+        args.checkpoint,
+        device=args.device,
+        model_name=args.model_name,
+        strict_window=args.strict_window,
+        max_batch=args.max_batch,
+    )
+    engine = server.get_engine()
+    check_engine(engine, args.base_revision)
+    if engine.cfg.model_name != args.model_name:
+        fail(f"engine model name {engine.cfg.model_name!r}, want {args.model_name!r}")
+
+    if not args.no_lock:
+        gate = Gate(args.waiters, args.lock_timeout)
+        evaluate = engine.evaluate
+
+        def gated_evaluate(request: Any) -> Any:
+            return gate.run(evaluate, request)
+
+        engine.evaluate = gated_evaluate
+
+    @app.exception_handler(Busy)
+    async def busy_handler(request: Any, exc: Busy) -> Any:
+        return JSONResponse(status_code=503, content={"detail": "busy", "code": "busy"},
+                            headers={"Retry-After": "1"})
+
+    @app.exception_handler(StarletteHTTPException)
+    async def http_handler(request: Any, exc: StarletteHTTPException) -> Any:
+        if exc.status_code == 422 and isinstance(exc.detail, str) and WINDOW_TEXT in exc.detail:
+            return JSONResponse(status_code=422,
+                                content={"detail": exc.detail, "code": "context_window_exceeded"})
+        return await http_exception_handler(request, exc)
+
+    @app.get("/ready")
+    def ready_route() -> Any:
+        if not ready.get("ready"):
+            return JSONResponse(status_code=503, content={"ready": False})
+        body = dict(ready)
+        body["gpu_memory_mib"] = gpu_memory_mib()
+        return JSONResponse(content=body)
+
+    # The last middleware that is added is the outermost one.
+    app.add_middleware(Activity, path=args.last_request_file)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=ALLOWED_HOSTS)
+    app.add_middleware(AccessLog)
+    return app, engine
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Serve Strands Decider v19 on the loopback interface.")
+    parser.add_argument("checkpoint")
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--model-name", required=True)
+    parser.add_argument("--v19-revision", required=True)
+    parser.add_argument("--base-revision", required=True)
+    parser.add_argument("--strict-window", action="store_true")
+    parser.add_argument("--max-batch", type=int, default=40)
+    parser.add_argument("--waiters", type=int, default=1)
+    parser.add_argument("--lock-timeout", type=float, default=1.5)
+    parser.add_argument("--limit-concurrency", type=int, default=16)
+    parser.add_argument("--run-dir", default="/run/decider")
+    parser.add_argument("--no-warmup", action="store_true", help="Tests only: no warm-up.")
+    parser.add_argument("--no-lock", action="store_true", help="Tests only: no lock.")
+    args = parser.parse_args()
+    args.last_request_file = os.path.join(args.run_dir, "last-request")
+    ready_file = os.path.join(args.run_dir, "ready")
+
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                        format="%(levelname)s %(name)s: %(message)s")
+    if args.host not in LOOPBACK:
+        raise SystemExit("decider-serve binds to a loopback address only")
+    os.makedirs(args.run_dir, exist_ok=True)
+    remove(ready_file)
+
+    sd_notify("STATUS=identity checks")
+    check_files(args.checkpoint, args.v19_revision, args.base_revision, args.model_name)
+
+    ready: Dict[str, Any] = {"ready": False}
+    sd_notify("STATUS=loading the model")
+    app, engine = build_app(args, ready)
+
+    import torch
+
+    info: Dict[str, Any] = {"warmup_ms": {}, "gate": {"pass": None}}
+    if not args.no_warmup:
+        sd_notify("STATUS=warm-up")
+        info = Warmup(engine, args.model_name).run(sd_notify)
+    ready.update({
+        "ready": True,
+        "model": args.model_name,
+        "v19_revision": args.v19_revision,
+        "base_revision": args.base_revision,
+        "warmup_ms": info["warmup_ms"],
+        "warmup_input_tokens": info.get("input_tokens", {}),
+        "warmup_chunk_ms": info.get("warmup_chunk_ms", {}),
+        "warmup_chunks_s": info.get("warmup_chunks_s"),
+        "warmup_total_s": info.get("warmup_total_s"),
+        "gate": info["gate"],
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "max_batch": args.max_batch,
+        "strict_window": args.strict_window,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    })
+
+    import uvicorn
+
+    class NotifyingServer(uvicorn.Server):
+        async def startup(self, sockets: Optional[List[Any]] = None) -> None:
+            await super().startup(sockets=sockets)
+            if self.should_exit:
+                return
+            write_atomic(ready_file, json.dumps(ready, sort_keys=True) + "\n")
+            gate = "pass" if ready["gate"].get("pass") else "FAIL"
+            sd_notify(f"READY=1\nSTATUS=serving on {args.host}:{args.port}, warm-up gate {gate}")
+            log.info("ready on %s:%d", args.host, args.port)
+
+    config = uvicorn.Config(app, host=args.host, port=args.port, workers=1,
+                            limit_concurrency=args.limit_concurrency, access_log=False,
+                            server_header=False, log_level="info")
+    try:
+        NotifyingServer(config).run()
+    finally:
+        sd_notify("STOPPING=1")
+        remove(ready_file)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

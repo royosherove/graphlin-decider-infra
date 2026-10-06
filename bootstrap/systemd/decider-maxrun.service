@@ -1,0 +1,9 @@
+# Maximum run time. The timer starts this unit 8 hours after boot.
+# Language: ASD-STE100.
+[Unit]
+Description=Strands Decider maximum run time: poweroff
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/logger -t decider-maxrun "maximum run time is over: poweroff"
+ExecStart=/usr/bin/systemctl --no-block poweroff
